@@ -190,30 +190,33 @@ class anis_pta():
 
         if self.mode == 'power_basis' or self.mode == 'sqrt_power_basis':
 
-            # [Claude optimization] Build Gamma_lm = (nclm, npairs) directly from
-            # the already-computed antenna response F_mat (= R_ab over the pixel
-            # grid) and the real-Ylm pixel maps Y_real (npix x nclm), instead of
-            # calling anis_basis (which loops over every (l,m) doing a full
-            # (npsr x npsr) covariance matmul per mode, then taking the off-
-            # diagonal pair elements). anis_basis[lm, a, b] = sum_pix R_ab[pix] *
-            # Y_real[pix, lm] for a != b (the diagonal pulsar term it adds is
-            # irrelevant for pairs), so Gamma_lm = (F_mat @ Y_real).T. This skips
-            # the (nclm, npsr, npsr) tensor and replaces nclm small matmuls with a
-            # single BLAS matmul: ~4-6x faster and HALF the matmul memory.
-            # Gamma_lm itself matches anis_basis to ~1e-16; because F_mat combines
-            # Fp/Fc into R_ab BEFORE contracting with the sky map (anis_basis
-            # contracts them separately), the downstream logLikelihood differs
-            # from the original by up to ~1e-12 -- negligible and well within
-            # tolerance. A bit-identical variant exists but needs 2x the matmul
-            # memory (per-polarization F_e @ doubled-Y_real), not worth it here.
+            # [Claude optimization] Build Gamma_lm = (nclm, npairs) as the forward
+            # (analysis) spherical-harmonic transform of each pulsar pair's antenna
+            # response map. anis_basis[lm, a, b] (a != b) = sum_pix R_ab[pix] *
+            # Y_real_lm[pix] -- i.e. the projection of the pair response F_mat[ab]
+            # onto the real Y_lm basis. With iter=0, healpy map2alm is the exact
+            # adjoint of the alm2map synthesis used for that basis, so
+            #     Gamma_lm[ab] = (npix / 4pi) * clmFromAlm(map2alm(F_mat[ab], iter=0))
+            # matches the explicit (F_mat @ Y_real) form to ~1e-16. This does
+            # npairs FFT-based SHTs (cost scales with npairs, not nclm) and -- key
+            # at high l_max -- NEVER materializes the (npix x nclm) Y_real matrix,
+            # which would be ~23 GB at l_max=120/nside=128 (so this is the only
+            # memory-feasible route at the target resolution). (Uses the vendored
+            # ac.clmFromAlm, whose negative-m convention matches almFromClm; this
+            # differs from anis_pta.clmFromAlm, which carries an extra (-1)**m.)
+            # Note: this Gamma_lm matches the pristine anis_basis to ~1e-16, but
+            # the power_basis logLikelihood is poorly conditioned w.r.t. Gamma_lm
+            # at small l_max (e.g. l=6: condition ~6e4), so that ~1e-16 difference
+            # shows up as ~1e-11 in ll_pow -- amplified machine epsilon, not a real
+            # accuracy loss. The sqrt-basis path is unaffected.
             nclm = (self.l_max + 1) ** 2
-            Y_real = np.zeros((self.npix, nclm))
-            e_lm = np.zeros(nclm)
-            for lm in range(nclm):
-                e_lm[lm] = 1.0
-                Y_real[:, lm] = ac.mapFromClm_fast(e_lm, nside = self.nside)
-                e_lm[lm] = 0.0
-            self.Gamma_lm = np.ascontiguousarray((self.F_mat @ Y_real).T)
+            norm = self.npix / (4 * np.pi)
+            self.Gamma_lm = np.zeros((nclm, self.npairs))
+            for i in range(self.npairs):
+                alm = hp.map2alm(np.ascontiguousarray(self.F_mat[i]),
+                                 lmax = self.l_max, iter = 0)
+                self.Gamma_lm[:, i] = norm * ac.clmFromAlm(alm)
+            self.Gamma_lm = np.ascontiguousarray(self.Gamma_lm)
 
         return None
     
