@@ -2,6 +2,8 @@ import numpy as np
 from healpy import Alm
 from sympy.physics.quantum.cg import CG
 from collections import OrderedDict
+import os
+from scipy import sparse as sp
 
 # [Claude optimization] Numerical Clebsch-Gordan coefficient via the Racah
 # closed-form formula, used by clebschGordan.calc_beta in place of sympy's
@@ -50,14 +52,20 @@ class clebschGordan():
     Class with methods for manipulating clebsch-gordon coeffcients.
     '''
 
-    def __init__(self, l_max):
-        
+    def __init__(self, l_max, cache_dir=None, beta_dense_max_bytes=2_000_000_000):
+
         self.almax = int(l_max)
         self.blmax = int(self.almax / 2.)  #CG selection rule to ensure positive power across all sky
-        
+
         ## size of arrays: for blms its only non-negative m values but for alms it is all of them
         self.alm_size = (self.almax + 1)**2
         self.blm_size = Alm.getsize(self.blmax)
+
+        # [Claude optimization] sparse-beta config: opt-in on-disk cache (keyed by
+        # l_max) and the byte budget above which the dense beta_vals property
+        # refuses to materialize (default ~2 GB).
+        self._cache_dir = cache_dir
+        self._beta_dense_max_bytes = int(beta_dense_max_bytes)
 
         ## calculate and store beta
         self.calc_beta()
@@ -119,28 +127,94 @@ class clebschGordan():
     def calc_beta(self):
 
         '''
-        Method to calculate beta array to convert from blm to alm
+        Method to calculate beta array to convert from blm to alm.
+
+        [Claude optimization] beta is exactly sparse: the Clebsch-Gordan
+        selection rules (M = m1+m2, triangle |l1-l2|<=L<=l1+l2, parity
+        (l1+l2+L) even, |M|<=L) force the vast majority of cells to zero. We
+        iterate only over the nonzero (jj, kk, L) combinations and store the
+        result as a scipy.sparse CSR matrix of shape (alm_size, nfull**2). The
+        dense tensor is available on demand via the beta_vals property. Values
+        are identical to the dense triple loop (same _cg_racah, same prefactor).
         '''
 
-        ## initialize beta array
-        beta_vals = np.zeros((self.alm_size, 2*self.blm_size - self.blmax - 1, 2*self.blm_size - self.blmax - 1))
+        nfull = 2 * self.blm_size - self.blmax - 1
 
-        for ii in range(beta_vals.shape[0]):
-            for jj in range(beta_vals.shape[1]):
-                for kk in range(beta_vals.shape[2]):
+        # Opt-in disk cache, keyed by l_max.
+        if self._cache_dir is not None and os.path.exists(self._beta_cache_path()):
+            self._beta_csr = sp.load_npz(self._beta_cache_path())
+            self._beta_shape = (self.alm_size, nfull, nfull)
+            return
 
-                    l1, m1 = self.idxtoalm(self.blmax, jj)
-                    l2, m2 = self.idxtoalm(self.blmax, kk)
-                    L, M = self.idxtoalm(self.almax, ii)
+        # (L, M) -> alm index, in the extended ordering used by idxtoalm.
+        almidx_of = {}
+        for ii in range(self.alm_size):
+            L, M = self.idxtoalm(self.almax, ii)
+            almidx_of[(int(L), int(M))] = ii
 
-                    ## clebs gordon coeffcients (numerical Racah; see _cg_racah)
-                    cg0 = _cg_racah(l1, 0, l2, 0, L, 0)
-                    cg1 = _cg_racah(l1, m1, l2, m2, L, M)
+        # (l, m) for every blm_full index.
+        lm = [self.idxtoalm(self.blmax, j) for j in range(nfull)]
 
-                    beta_vals[ii, jj, kk] =  np.sqrt( (2*l1 + 1) * (2*l2 + 1) / ((4*np.pi) * (2*L + 1) )) * cg0 * cg1
+        # cg0(l1, l2, L) depends only on (l1, l2, L); cache it.
+        cg0_cache = {}
+        def cg0(l1, l2, L):
+            v = cg0_cache.get((l1, l2, L))
+            if v is None:
+                v = _cg_racah(l1, 0, l2, 0, L, 0)
+                cg0_cache[(l1, l2, L)] = v
+            return v
 
+        four_pi = 4 * np.pi
+        rows, cols, data = [], [], []
+        for jj in range(nfull):
+            l1, m1 = int(lm[jj][0]), int(lm[jj][1])
+            for kk in range(nfull):
+                l2, m2 = int(lm[kk][0]), int(lm[kk][1])
+                M = m1 + m2
+                for L in range(abs(l1 - l2), l1 + l2 + 1):
+                    if (l1 + l2 + L) % 2:      # cg0 parity selection rule
+                        continue
+                    if abs(M) > L:             # cg1 requires |M| <= L
+                        continue
+                    c0 = cg0(l1, l2, L)
+                    if c0 == 0.0:
+                        continue
+                    c1 = _cg_racah(l1, m1, l2, m2, L, M)
+                    if c1 == 0.0:
+                        continue
+                    val = np.sqrt((2*l1 + 1) * (2*l2 + 1) / (four_pi * (2*L + 1))) * c0 * c1
+                    if val != 0.0:
+                        rows.append(almidx_of[(L, M)])
+                        cols.append(jj * nfull + kk)
+                        data.append(val)
 
-        self.beta_vals = beta_vals
+        self._beta_csr = sp.csr_matrix(
+            (np.array(data, dtype=float),
+             (np.array(rows, dtype=np.int64), np.array(cols, dtype=np.int64))),
+            shape=(self.alm_size, nfull * nfull))
+        self._beta_shape = (self.alm_size, nfull, nfull)
+
+        if self._cache_dir is not None:
+            os.makedirs(self._cache_dir, exist_ok=True)
+            sp.save_npz(self._beta_cache_path(), self._beta_csr)
+
+    def _beta_cache_path(self):
+        # [Claude optimization] cache filename keyed by l_max (+ format version).
+        return os.path.join(self._cache_dir, "maps_beta_lmax%d_v1.npz" % self.almax)
+
+    @property
+    def beta_vals(self):
+        # [Claude optimization] Lazy dense reconstruction of the sparse beta for
+        # backward-compatibility/inspection. Refuses to allocate beyond the
+        # configured byte budget so high l_max never silently tries ~49 GB.
+        alm_size, nfull, _ = self._beta_shape
+        nbytes = alm_size * nfull * nfull * 8
+        if nbytes > self._beta_dense_max_bytes:
+            raise MemoryError(
+                "Dense beta_vals would need %.1f GB (l_max=%d); it is stored "
+                "sparsely as self._beta_csr. Raise self._beta_dense_max_bytes "
+                "to force dense reconstruction." % (nbytes / 1e9, self.almax))
+        return np.asarray(self._beta_csr.todense()).reshape(self._beta_shape)
 
     def calc_blm_full(self, blms_in):
 
