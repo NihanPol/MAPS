@@ -339,7 +339,16 @@ def woodbury_inverse(A, U, C, V, ret_cond = False):
     """
 
     Ainv = np.diag( 1/np.diag(A) )
-    Cinv = np.linalg.pinv(C)
+    # [Claude optimization] When C is the identity matrix (the (A + K)^-1 use
+    # case, e.g. as called by anis_pta._get_N_inv with U = C = I), pinv(C) == C
+    # exactly, so we skip the O(n^3) SVD-based pseudo-inverse. This is
+    # numerically identical (an O(n^2) equality check vs. a full SVD) and falls
+    # back to np.linalg.pinv for any general C. Profiled saving: ~0.55 s/call
+    # at npair=990.
+    if C.ndim == 2 and C.shape[0] == C.shape[1] and np.array_equal(C, np.eye(C.shape[0])):
+        Cinv = C
+    else:
+        Cinv = np.linalg.pinv(C)
 
     # (A+UCV)^-1 = (A^-1) - A^-1 @ U @ (C^-1 + V @ A^-1 @ U)^-1 @ V @ A^-1
     CVAU = Cinv + V @ Ainv @ U
