@@ -400,10 +400,11 @@ class anis_pta():
         FpFc = ac.signalResponse_fast(self.psrs_theta, self.psrs_phi, gwtheta, gwphi)
         Fp,Fc = FpFc[:,0::2], FpFc[:,1::2] 
 
-        R_abk = np.zeros( (self.npairs,self.npix) )
-        # Now lets do some multiplication
-        for i,(a,b) in enumerate(self.pair_idx):
-            R_abk[i] = Fp[a]*Fp[b] + Fc[a]*Fc[b]
+        # [Claude optimization] vectorized over all pairs at once (was a per-pair
+        # Python loop). Bit-identical: same elementwise Fp/Fc products per pair.
+        a_idx = self.pair_idx[:, 0]
+        b_idx = self.pair_idx[:, 1]
+        R_abk = Fp[a_idx] * Fp[b_idx] + Fc[a_idx] * Fc[b_idx]
 
         return R_abk
     
