@@ -6,13 +6,23 @@ from collections import OrderedDict
 # [Claude optimization] Numerical Clebsch-Gordan coefficient via the Racah
 # closed-form formula, used by clebschGordan.calc_beta in place of sympy's
 # symbolic CG(...).doit().evalf(). Verified to reproduce the symbolic result to
-# 0.0 absolute difference across l_max = 0..8, and is ~600x faster
-# (calc_beta at l_max=6: ~3.1 s -> ~5 ms). Integer angular momenta only, which
-# is all this module uses. Returns 0.0 when the selection rules are violated.
+# ~1e-16 absolute difference across l_max = 0..12 (exhaustive vs sympy). The
+# per-coefficient CG call is ~30-40x faster than sympy; calc_beta as a whole is
+# ~5x faster (l_max=6: ~3.1 s -> ~0.6 s) because it is still a Python triple
+# loop (49x16x16) -- after this change the loop, not the CG call, is the
+# dominant cost (a future vectorization could speed it up further). Integer
+# angular momenta only, which is all this module uses; returns 0.0 when the
+# selection rules are violated.
 from math import factorial as _fac, sqrt as _sqrt
 
 def _cg_racah(j1, m1, j2, m2, J, M):
     """Clebsch-Gordan coefficient <j1 m1 j2 m2 | J M> (integer spins)."""
+    # [Claude optimization] Cast to Python int up front. calc_beta passes
+    # numpy.int64 indices (from healpy Alm.getlm via idxtoalm); numpy integer
+    # arithmetic on the factorial products below silently overflows int64 and
+    # wraps negative -> math.sqrt domain error for l_max >= 14. Python ints are
+    # arbitrary precision, matching sympy's behavior on the original code path.
+    j1, m1, j2, m2, J, M = int(j1), int(m1), int(j2), int(m2), int(J), int(M)
     if M != m1 + m2:
         return 0.0
     if (J < abs(j1 - j2)) or (J > j1 + j2):
