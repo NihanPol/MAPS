@@ -192,10 +192,15 @@ class anis_pta():
             Gamma_lm_mat = ac.anis_basis(np.dstack((self.psrs_phi, self.psrs_theta))[0], 
                                          lmax = self.l_max, nside = self.nside)
             
-            # We need to reorder Gamma_lm_mat to shape (nclm, npairs)
-            self.Gamma_lm = np.zeros((Gamma_lm_mat.shape[0], self.npairs))
-            for i, (a, b) in enumerate(self.pair_idx):
-                self.Gamma_lm[:, i] = Gamma_lm_mat[:, a, b]
+            # [Claude optimization] vectorized reorder to (nclm, npairs) via fancy
+            # indexing (was a per-pair Python loop). np.ascontiguousarray forces
+            # the same C-contiguous layout the original np.zeros produced, so the
+            # downstream np.sum(..., axis=0) reduces in the identical order and
+            # the result is bitwise-identical (the bare fancy index is
+            # F-contiguous, which would reorder the reduction by ~1e-13).
+            a_idx = self.pair_idx[:, 0]
+            b_idx = self.pair_idx[:, 1]
+            self.Gamma_lm = np.ascontiguousarray(Gamma_lm_mat[:, a_idx, b_idx])
 
         return None
     
