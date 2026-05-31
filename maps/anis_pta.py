@@ -157,7 +157,18 @@ class anis_pta():
         else:
             raise ValueError("mode must be either 'pixel', 'power_basis','sqrt_power_basis' or 'hybrid'")
         
-        self.sqrt_basis_helper = CG.clebschGordan(l_max = self.l_max)
+        # [Claude optimization] Building the Clebsch-Gordan helper triggers an
+        # expensive symbolic-sympy precompute (clebschGordan.calc_beta, ~3 s at
+        # l_max=6) that is ONLY used by the square-root power basis. The other
+        # modes ('power_basis', 'hybrid', 'pixel') never touch
+        # sqrt_basis_helper, so we skip the build for them and leave the
+        # attribute as None. This is behavior-preserving for those modes
+        # (the attribute was previously an unused object) and removes the cost
+        # from every non-sqrt construction, including the default power_basis.
+        if self.mode == 'sqrt_power_basis':
+            self.sqrt_basis_helper = CG.clebschGordan(l_max = self.l_max)
+        else:
+            self.sqrt_basis_helper = None
         #self.reorder, self.neg_idx, self.zero_idx, self.pos_idx = self.reorder_hp_ylm()
 
         if self.mode == 'power_basis':
