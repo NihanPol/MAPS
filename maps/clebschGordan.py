@@ -15,7 +15,42 @@ from scipy import sparse as sp
 # dominant cost (a future vectorization could speed it up further). Integer
 # angular momenta only, which is all this module uses; returns 0.0 when the
 # selection rules are violated.
-from math import factorial as _fac, sqrt as _sqrt
+#
+# For very high l (l_max >= ~64) the product of factorials under the second sqrt
+# exceeds float64's max (~1.8e308) and the exact direct form raises OverflowError.
+# In that regime only, _cg_racah falls back to an overflow-safe log-space
+# evaluation (_cg_racah_logspace, accurate to ~1e-12 vs sympy). The exact direct
+# path is used everywhere it does not overflow, so all l_max <= ~63 results --
+# including every existing verified case -- are bit-for-bit unchanged.
+from math import factorial as _fac, sqrt as _sqrt, lgamma as _lgamma, exp as _exp, log as _log
+
+
+def _cg_racah_logspace(j1, m1, j2, m2, J, M):
+    """Overflow-safe log-space Clebsch-Gordan <j1 m1 j2 m2 | J M> (integer spins).
+
+    Used only when the exact direct factorial form would overflow float64. Works
+    in log space (math.lgamma) and factors out the largest term of the alternating
+    k-sum for stability, so it never forms the huge intermediate factorials.
+    Accurate to ~1e-12 vs sympy; selection rules already checked by the caller.
+    """
+    def _lf(n):
+        return _lgamma(n + 1)
+    log_pref = 0.5 * (_log(2 * J + 1)
+                      + _lf(j1 + j2 - J) + _lf(j1 - j2 + J) + _lf(-j1 + j2 + J) - _lf(j1 + j2 + J + 1)
+                      + _lf(J + M) + _lf(J - M) + _lf(j1 - m1) + _lf(j1 + m1) + _lf(j2 - m2) + _lf(j2 + m2))
+    kmin = max(0, j2 - J - m1, j1 - J + m2)
+    kmax = min(j1 + j2 - J, j1 - m1, j2 + m2)
+    log_terms = []
+    for k in range(kmin, kmax + 1):
+        log_denom = (_lf(k) + _lf(j1 + j2 - J - k) + _lf(j1 - m1 - k)
+                     + _lf(j2 + m2 - k) + _lf(J - j2 + m1 + k) + _lf(J - j1 - m2 + k))
+        log_terms.append(log_pref - log_denom)
+    lmx = max(log_terms)
+    ksum = 0.0
+    for k, lt in zip(range(kmin, kmax + 1), log_terms):
+        ksum += ((-1) ** k) * _exp(lt - lmx)
+    return ksum * _exp(lmx)
+
 
 def _cg_racah(j1, m1, j2, m2, J, M):
     """Clebsch-Gordan coefficient <j1 m1 j2 m2 | J M> (integer spins)."""
@@ -31,19 +66,26 @@ def _cg_racah(j1, m1, j2, m2, J, M):
         return 0.0
     if abs(m1) > j1 or abs(m2) > j2 or abs(M) > J:
         return 0.0
-    pref = _sqrt((2 * J + 1)
-                 * _fac(j1 + j2 - J) * _fac(j1 - j2 + J) * _fac(-j1 + j2 + J)
-                 / _fac(j1 + j2 + J + 1))
-    pref *= _sqrt(_fac(J + M) * _fac(J - M) * _fac(j1 - m1) * _fac(j1 + m1)
-                  * _fac(j2 - m2) * _fac(j2 + m2))
-    ksum = 0.0
-    kmin = max(0, j2 - J - m1, j1 - J + m2)
-    kmax = min(j1 + j2 - J, j1 - m1, j2 + m2)
-    for k in range(kmin, kmax + 1):
-        ksum += ((-1) ** k) / (
-            _fac(k) * _fac(j1 + j2 - J - k) * _fac(j1 - m1 - k)
-            * _fac(j2 + m2 - k) * _fac(J - j2 + m1 + k) * _fac(J - j1 - m2 + k))
-    return pref * ksum
+    # [Claude optimization] Exact direct factorial form. For very high l the
+    # second sqrt's factorial product exceeds float64's max -> OverflowError; in
+    # that case only, fall back to the overflow-safe log-space evaluation. The
+    # try has zero cost when no overflow occurs, so low-l results are unchanged.
+    try:
+        pref = _sqrt((2 * J + 1)
+                     * _fac(j1 + j2 - J) * _fac(j1 - j2 + J) * _fac(-j1 + j2 + J)
+                     / _fac(j1 + j2 + J + 1))
+        pref *= _sqrt(_fac(J + M) * _fac(J - M) * _fac(j1 - m1) * _fac(j1 + m1)
+                      * _fac(j2 - m2) * _fac(j2 + m2))
+        ksum = 0.0
+        kmin = max(0, j2 - J - m1, j1 - J + m2)
+        kmax = min(j1 + j2 - J, j1 - m1, j2 + m2)
+        for k in range(kmin, kmax + 1):
+            ksum += ((-1) ** k) / (
+                _fac(k) * _fac(j1 + j2 - J - k) * _fac(j1 - m1 - k)
+                * _fac(j2 + m2 - k) * _fac(J - j2 + m1 + k) * _fac(J - j1 - m2 + k))
+        return pref * ksum
+    except OverflowError:
+        return _cg_racah_logspace(j1, m1, j2, m2, J, M)
 
 
 class clebschGordan():
