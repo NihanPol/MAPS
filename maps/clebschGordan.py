@@ -250,7 +250,11 @@ class clebschGordan():
         ## convert blm array into a full blm array with -m values too
         blm_full = self.calc_blm_full(blms_in)
 
-        alm_vals = np.einsum('ijk,j,k', self.beta_vals, blm_full, blm_full)
+        # [Claude optimization] Sparse contraction alm_i = sum_jk beta_ijk b_j b_k
+        # = self._beta_csr @ vec(b (x) b). Avoids materializing the dense beta
+        # tensor (which is ~49 GB at l_max=67).
+        bb = np.outer(blm_full, blm_full).ravel()
+        alm_vals = self._beta_csr.dot(bb)
 
         return alm_vals
 
