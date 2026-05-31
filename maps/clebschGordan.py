@@ -207,9 +207,18 @@ class clebschGordan():
             return v
 
         four_pi = 4 * np.pi
-        rows, cols, data = [], [], []
+        # [Claude optimization] Memory-frugal accumulation: collect each jj's
+        # nonzeros into small per-row Python lists, convert to numpy arrays per
+        # block, and concatenate once at the end. This keeps the bulk in
+        # int32/float64 arrays (~16 bytes/nonzero) rather than one giant Python
+        # list of boxed ints/floats (~3x larger), which OOMs at very high l_max.
+        # int32 column indices are safe while nfull**2 < 2**31 (true to l_max
+        # ~460); otherwise fall back to int64.
+        idx_dtype = np.int32 if (nfull * nfull) < 2 ** 31 else np.int64
+        row_blocks, col_blocks, data_blocks = [], [], []
         for jj in range(nfull):
             l1, m1 = int(lm[jj][0]), int(lm[jj][1])
+            r, c, d = [], [], []
             for kk in range(nfull):
                 l2, m2 = int(lm[kk][0]), int(lm[kk][1])
                 M = m1 + m2
@@ -226,13 +235,25 @@ class clebschGordan():
                         continue
                     val = np.sqrt((2*l1 + 1) * (2*l2 + 1) / (four_pi * (2*L + 1))) * c0 * c1
                     if val != 0.0:
-                        rows.append(almidx_of[(L, M)])
-                        cols.append(jj * nfull + kk)
-                        data.append(val)
+                        r.append(almidx_of[(L, M)])
+                        c.append(jj * nfull + kk)
+                        d.append(val)
+            if d:
+                row_blocks.append(np.array(r, dtype=idx_dtype))
+                col_blocks.append(np.array(c, dtype=idx_dtype))
+                data_blocks.append(np.array(d, dtype=float))
+
+        if data_blocks:
+            rows = np.concatenate(row_blocks)
+            cols = np.concatenate(col_blocks)
+            data = np.concatenate(data_blocks)
+        else:
+            rows = np.empty(0, idx_dtype)
+            cols = np.empty(0, idx_dtype)
+            data = np.empty(0, dtype=float)
 
         self._beta_csr = sp.csr_matrix(
-            (np.array(data, dtype=float),
-             (np.array(rows, dtype=np.int64), np.array(cols, dtype=np.int64))),
+            (data, (rows, cols)),
             shape=(self.alm_size, nfull * nfull))
         self._beta_shape = (self.alm_size, nfull, nfull)
 
