@@ -9,7 +9,12 @@ setup(
     # Needed to actually package something
     packages=['maps'],
     # Needed for dependencies
-    install_requires=['numpy', 'scipy', 'sympy', 'astroML', 'PTMCMCSampler', 'healpy', 'lmfit'],
+    # [Claude optimization] 'numba' added: it backs the high-l_max (>=64) calc_beta
+    # fast path (clebschGordan). It is imported behind a guard, so its absence only
+    # disables that acceleration (the exact path still works). The previous
+    # (undeclared) 'enterprise' dependency is gone -- anis_coefficients is now
+    # vendored into maps/anis_coefficients.py.
+    install_requires=['numpy', 'scipy', 'sympy', 'astroML', 'PTMCMCSampler', 'healpy', 'lmfit', 'numba'],
     # *strongly* suggested for sharing
     version='0.4.2',
     # The license can be anything you like
