@@ -62,7 +62,9 @@ class anis_pta():
         include_pta_monopole (bool): Whether to include the monopole term in the search.
         mode (str): The mode of the spherical harmonic decomposition to use.
             Must be 'power_basis', 'sqrt_power_basis', or 'hybrid'.
-        sqrt_basis_helper (CG.clebschGordan): A helper object for the sqrt power basis.
+        sqrt_basis_helper (CG.clebschGordan or None): Clebsch-Gordan helper for the
+            sqrt power basis. Built only when mode == 'sqrt_power_basis'; None for
+            the 'power_basis', 'hybrid' and 'pixel' modes (which never use it).
         ndim (int): The number of dimensions for the search.
         F_mat (np.ndarray): The antenna response matrix [npair x npix].
         Gamma_lm (np.ndarray): The spherical harmonic basis [npair x ndim].

@@ -87,6 +87,16 @@ def convert_blm_params_to_clm(pta_anis, blm_params):
         clms: The array of c_lm parameters
     """
 
+    # [Claude optimization] sqrt_basis_helper is built only for
+    # mode == 'sqrt_power_basis' (None otherwise; see anis_pta.__init__). This
+    # blm -> clm conversion is only meaningful for sqrt-basis (b_lm) parameters,
+    # so fail with a clear message instead of an opaque AttributeError on None.
+    if pta_anis.sqrt_basis_helper is None:
+        raise ValueError(
+            "convert_blm_params_to_clm requires an anis_pta built with "
+            "mode='sqrt_power_basis'; sqrt_basis_helper is None for mode "
+            f"'{pta_anis.mode}'.")
+
     blm = pta_anis.sqrt_basis_helper.blm_params_2_blms(blm_params[1:])
 
     #Note that when using this mode, the supplied params need to be in
