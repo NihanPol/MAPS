@@ -223,6 +223,15 @@ class anis_pta():
             self.rho = np.array(rho) / self.os
             self.sig = np.array(sig) / self.os
 
+            # [Claude optimization] Precompute the constant Gaussian log-norm
+            # sum(log(1/(sig*sqrt(2pi)))) once here. It depends only on sig
+            # (fixed between logLikelihood calls), so caching it avoids
+            # recomputing a log over all pairs on every MCMC / lmfit evaluation
+            # in logLikelihood. Numerically identical (same value, computed once
+            # from the same self.sig).
+            _beta = np.longdouble(1 / (self.sig * np.sqrt(2 * np.pi)))
+            self._loglike_norm = np.sum(np.log(_beta))
+
             # Set the inverse of the pair independent covariance matrix
             self.pair_ind_N_inv = self._get_N_inv(pair_cov = False)
 
@@ -230,6 +239,7 @@ class anis_pta():
             self.rho = None
             self.sig = None
             self.os = None
+            self._loglike_norm = None
 
         if covariance is not None:
             self.pair_cov = covariance / self.os**2
@@ -459,28 +469,35 @@ class anis_pta():
         """
         #nalm = len(alm)
         #maxl = int(np.sqrt(9.0 - 4.0 * (2.0 - 2.0 * nalm)) * 0.5 - 1.5)  # Really?
-        maxl = self.l_max
-        nclm = (maxl + 1) ** 2
+        # [Claude optimization] The alm->clm index map (which alm index, whether
+        # to take the real or imaginary part, and the (-1)**m * sqrt(2) factor)
+        # depends only on l_max, so build it once and cache it, then apply it as
+        # a vectorized gather. This replaces the original per-call Python double
+        # loop with ~(l_max+1)**2 hp.Alm.getidx calls, run on every MCMC / lmfit
+        # residual evaluation in the sqrt basis. Numerically identical: the same
+        # alm entries, parts, and factors are used. (Multiplying by the exact
+        # +/-1 sign distributes through IEEE rounding, so results are bit-equal.)
+        if not hasattr(self, '_clm_almindex'):
+            maxl = self.l_max
+            nclm = (maxl + 1) ** 2
+            self._clm_almindex = np.zeros(nclm, dtype='int')
+            self._clm_use_imag = np.zeros(nclm, dtype=bool)
+            self._clm_factor = np.zeros(nclm, dtype='float')
+            _ci = 0
+            for ll in range(0, maxl + 1):
+                for mm in range(-ll, ll + 1):
+                    self._clm_almindex[_ci] = hp.Alm.getidx(maxl, ll, abs(mm))
+                    if mm == 0:
+                        self._clm_factor[_ci] = 1.0
+                    elif mm < 0:
+                        self._clm_use_imag[_ci] = True
+                        self._clm_factor[_ci] = (-1) ** mm * np.sqrt(2)
+                    else:
+                        self._clm_factor[_ci] = (-1) ** mm * np.sqrt(2)
+                    _ci += 1
 
-        # Check the solution. Went wrong one time..
-        #if nalm != int(0.5 * (maxl + 1) * (maxl + 2)):
-        #    raise ValueError("Check numerical precision. This should not happen")
-
-        clm = np.zeros(nclm)
-
-        clmindex = 0
-        for ll in range(0, maxl + 1):
-            for mm in range(-ll, ll + 1):
-                almindex = hp.Alm.getidx(maxl, ll, abs(mm))
-
-                if mm == 0:
-                    clm[clmindex] = alm[almindex].real
-                elif mm < 0:
-                    clm[clmindex] = (-1) ** mm * alm[almindex].imag * np.sqrt(2)
-                elif mm > 0:
-                    clm[clmindex] = (-1) ** mm * alm[almindex].real * np.sqrt(2)
-
-                clmindex += 1
+        _a = alm[self._clm_almindex]
+        clm = np.where(self._clm_use_imag, _a.imag, _a.real) * self._clm_factor
 
         return clm
     
@@ -1120,9 +1137,10 @@ class anis_pta():
 
             #Decompose the likelihood which is a product of gaussians into sums when getting log-likely
             alpha = (self.rho - sim_orf) ** 2 / (2 * self.sig ** 2)
-            beta = np.longdouble(1 / (self.sig * np.sqrt(2 * np.pi)))
-
-            loglike = np.sum(np.log(beta)) - np.sum(alpha)
+            # [Claude optimization] Use the cached constant normalization
+            # (self._loglike_norm, computed once in set_data) instead of
+            # recomputing sum(log(1/(sig*sqrt(2pi)))) on every call.
+            loglike = self._loglike_norm - np.sum(alpha)
 
         elif self.mode == 'power_basis':
 
@@ -1134,9 +1152,10 @@ class anis_pta():
             sim_orf = amp2 * np.sum(clm[:, np.newaxis] * self.Gamma_lm, axis = 0)
 
             alpha = (self.rho - sim_orf) ** 2 / (2 * self.sig ** 2)
-            beta = np.longdouble(1 / (self.sig * np.sqrt(2 * np.pi)))
-
-            loglike = np.sum(np.log(beta)) - np.sum(alpha)
+            # [Claude optimization] Use the cached constant normalization
+            # (self._loglike_norm, computed once in set_data) instead of
+            # recomputing sum(log(1/(sig*sqrt(2pi)))) on every call.
+            loglike = self._loglike_norm - np.sum(alpha)
 
         elif self.mode == 'sqrt_power_basis':
 
@@ -1157,9 +1176,10 @@ class anis_pta():
             sim_orf = amp2 * np.sum(clms_rvylm[:, np.newaxis] * self.Gamma_lm, axis = 0)
 
             alpha = (self.rho - sim_orf) ** 2 / (2 * self.sig ** 2)
-            beta = np.longdouble(1 / (self.sig * np.sqrt(2 * np.pi)))
-
-            loglike = np.sum(np.log(beta)) - np.sum(alpha)
+            # [Claude optimization] Use the cached constant normalization
+            # (self._loglike_norm, computed once in set_data) instead of
+            # recomputing sum(log(1/(sig*sqrt(2pi)))) on every call.
+            loglike = self._loglike_norm - np.sum(alpha)
 
         return loglike
         #return np.prod(gauss, dtype = np.longdouble)

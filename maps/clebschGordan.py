@@ -65,6 +65,23 @@ class clebschGordan():
             #lval, mval = Alm.getlm(blmax, jj)
             self.bl_idx[ii], self.bm_idx[ii] = self.idxtoalm(self.blmax, ii)
 
+        # [Claude optimization] Precompute the constant gather/sign maps used by
+        # calc_blm_full. These depend only on blmax (fixed at construction), so
+        # building them once turns the per-evaluation Python loop over
+        # Alm.getidx (run on every MCMC / lmfit residual in the sqrt basis) into
+        # a single vectorized gather. Numerically identical to the original loop
+        # (same source indices, same (-1)**|m| signs, same conjugation).
+        _n_full = self.bl_idx.size
+        self._blmfull_src = np.zeros(_n_full, dtype='int')   # |m| entry to read
+        self._blmfull_neg = np.zeros(_n_full, dtype=bool)    # True where m < 0
+        self._blmfull_sign = np.ones(_n_full, dtype='float')  # (-1)**|m| where m<0
+        for jj in range(_n_full):
+            _lval, _mval = self.bl_idx[jj], self.bm_idx[jj]
+            self._blmfull_src[jj] = Alm.getidx(self.blmax, _lval, abs(_mval))
+            if _mval < 0:
+                self._blmfull_neg[jj] = True
+                self._blmfull_sign[jj] = (-1) ** abs(_mval)
+
 
     def idxtoalm(self, lmax, ii):
 
@@ -125,20 +142,15 @@ class clebschGordan():
 
         '''
 
-        ## Array of blm values for both +ve and -ve indices
-        blms_full = np.zeros(2*self.blm_size - self.blmax - 1, dtype='complex')
-
-
-        for jj in range(blms_full.size):
-
-            lval, mval = self.bl_idx[jj], self.bm_idx[jj]
-
-            if mval >= 0:
-                blms_full[jj] = blms_in[Alm.getidx(self.blmax, lval, mval)]
-
-            elif mval < 0:
-                mval = -mval
-                blms_full[jj] = (-1)**mval *  np.conj(blms_in[Alm.getidx(self.blmax, lval, mval)])
+        # [Claude optimization] Vectorized gather using the maps precomputed in
+        # __init__ (_blmfull_src / _blmfull_neg / _blmfull_sign), replacing the
+        # original per-call Python loop over Alm.getidx. Numerically identical:
+        # positive-m entries are copied straight from blms_in; negative-m entries
+        # become (-1)**|m| * conj(blms_in[|m| entry]).
+        _vals = blms_in[self._blmfull_src]
+        blms_full = np.where(self._blmfull_neg,
+                             self._blmfull_sign * np.conj(_vals),
+                             _vals)
 
         return blms_full
 
