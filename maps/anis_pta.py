@@ -7,7 +7,9 @@ import pickle, healpy as hp
 import numpy.random as nr, scipy.stats as scst
 from PTMCMCSampler.PTMCMCSampler import PTSampler as ptmcmc
 
-from enterprise.signals import anis_coefficients as ac
+# [Claude optimization] anis_coefficients is now vendored into MAPS (was
+# enterprise.signals.anis_coefficients) to drop the hard enterprise dependency.
+from . import anis_coefficients as ac
 
 import sympy
 
