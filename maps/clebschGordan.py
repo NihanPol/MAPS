@@ -261,10 +261,45 @@ class clebschGordan():
 
     '''
     Class with methods for manipulating clebsch-gordon coeffcients.
+
+    Warning:
+        [Claude] Accuracy degrades at high l_max. The general-m Clebsch-Gordan
+        coefficients used to convert the sqrt-power b_lm -> c_lm are evaluated in
+        float64 via an alternating Racah sum that suffers catastrophic
+        cancellation growing with l_max. Results are effectively exact for
+        l_max <= 63, degrade through l_max = 64..120 (the worst
+        meaningful-magnitude coefficients reach tens of percent relative error
+        by l_max ~ 120, and small coefficients can even flip sign), and are
+        refused above SAFE_LMAX (= 120): constructing with l_max > 120 raises
+        ValueError unless allow_lossy_cg=True. Prefer l_max <= 63 for
+        high-fidelity power maps / angular power spectra. (The all-m = 0
+        coefficients use a cancellation-free closed form and are unaffected.)
     '''
 
     def __init__(self, l_max, cache_dir=None, beta_dense_max_bytes=2_000_000_000,
                  allow_lossy_cg=False):
+        """Build the Clebsch-Gordan helper for the sqrt-power basis at l_max.
+
+        [Claude] Args:
+            l_max (int): Maximum multipole of the (clm) power map; the sqrt
+                parameters run to blmax = l_max // 2.
+            cache_dir (str, optional): If given, the sparse beta matrix is cached
+                to / loaded from this directory (keyed by l_max). Default None.
+            beta_dense_max_bytes (int): Byte budget above which the dense
+                ``beta_vals`` property refuses to materialize (default ~2 GB).
+            allow_lossy_cg (bool): Permit construction above SAFE_LMAX despite the
+                loss of accuracy described in the warning below. Default False.
+
+        Warning:
+            [Claude] Accuracy degrades at high l_max. The general-m Clebsch-Gordan
+            coefficients are computed by a float64 alternating Racah sum subject
+            to catastrophic cancellation that grows with l_max: effectively exact
+            for l_max <= 63, degrading through l_max = 64..120 (worst meaningful
+            coefficients reach tens of percent relative error by l_max ~ 120),
+            and untrustworthy beyond. l_max > SAFE_LMAX (= 120) raises ValueError
+            unless allow_lossy_cg=True (which only warns and proceeds with the
+            reduced accuracy).
+        """
 
         self.almax = int(l_max)
         self.blmax = int(self.almax / 2.)  #CG selection rule to ensure positive power across all sky
@@ -368,6 +403,12 @@ class clebschGordan():
         result as a scipy.sparse CSR matrix of shape (alm_size, nfull**2). The
         dense tensor is available on demand via the beta_vals property. Values
         are identical to the dense triple loop (same _cg_racah, same prefactor).
+
+        Warning:
+            [Claude] The general-m Clebsch-Gordan values lose accuracy to float64
+            catastrophic cancellation as l_max grows (see the class docstring):
+            effectively exact for l_max <= 63, tens-of-percent worst-case error
+            by l_max ~ 120, and refused above SAFE_LMAX = 120.
         '''
 
         nfull = 2 * self.blm_size - self.blmax - 1

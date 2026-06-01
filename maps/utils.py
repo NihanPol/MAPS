@@ -87,6 +87,18 @@ def convert_blm_params_to_clm(pta_anis, blm_params):
 
     Returns:
         clms: The array of c_lm parameters
+
+    Raises:
+        ValueError: [Claude] If pta_anis was not built with
+            mode='sqrt_power_basis' (sqrt_basis_helper is None).
+
+    Warning:
+        [Claude] Accuracy at high l_max. This conversion runs the b_lm -> c_lm
+        Clebsch-Gordan transform, which loses accuracy to float64 catastrophic
+        cancellation as l_max grows: effectively exact for l_max <= 63,
+        tens-of-percent worst-case coefficient error by l_max ~ 120, and
+        unavailable above clebschGordan.SAFE_LMAX (=120) unless the object was
+        built with allow_lossy_cg=True. Prefer l_max <= 63 for high fidelity.
     """
 
     # [Claude optimization] sqrt_basis_helper is built only for

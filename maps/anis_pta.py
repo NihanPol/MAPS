@@ -100,9 +100,41 @@ class anis_pta():
             use_physical_prior (bool): Whether to use physical priors or not.
             include_pta_monopole (bool): Whether to include the monopole term in the search.
             pair_idx (np.ndarray, optional): An array of pulsar indices for each pair [npair x 2].
+            beta_cache_dir (str, optional): [Claude] Directory for the opt-in
+                on-disk cache of the sqrt-basis Clebsch-Gordan ``beta`` matrix
+                (keyed by l_max). Only used for mode='sqrt_power_basis'. Defaults
+                to None (no caching).
+            allow_lossy_cg (bool): [Claude] For mode='sqrt_power_basis' only,
+                permit l_max above clebschGordan.SAFE_LMAX (=120) despite the loss
+                of Clebsch-Gordan accuracy (see Warnings). Defaults to False.
+
+        Warnings:
+            [Claude] Accuracy at high l_max -- both bases (band limit). The
+            spherical-harmonic basis ``Gamma_lm`` is built from the healpy
+            spherical-harmonic transform of the pair response maps and is
+            band-limited by the pixelization: it is only reliable while
+            l_max <= ~3*nside - 1 (a conservative choice is l_max <= 2*nside).
+            Raising l_max without a correspondingly larger nside aliases the basis
+            and degrades both 'power_basis' and 'sqrt_power_basis' results. The
+            'power_basis' linear inversion (see max_lkl_clm) additionally becomes
+            ill-conditioned as the mode count (l_max+1)**2 approaches the number
+            of pulsar pairs.
+
+            [Claude] Accuracy at high l_max -- square-root basis only (CG
+            cancellation). In mode='sqrt_power_basis' the b_lm -> c_lm
+            Clebsch-Gordan transform is evaluated in float64 and its general-m
+            coefficients suffer catastrophic cancellation that grows with l_max:
+            effectively exact for l_max <= 63, degrading through l_max = 64..120
+            (the worst meaningful-magnitude coefficients reach tens of percent
+            relative error by l_max ~ 120, and small coefficients can flip sign).
+            Building with l_max > 120 raises ValueError unless allow_lossy_cg=True.
+            Prefer l_max <= 63 for high-fidelity sqrt-basis results. ('power_basis'
+            does not use the Clebsch-Gordan transform and is free of this issue.)
 
         Raises:
             ValueError: If the lengths of psrs_theta and psrs_phi are not equal.
+            ValueError: [Claude] If mode='sqrt_power_basis' and l_max exceeds
+                clebschGordan.SAFE_LMAX (=120) while allow_lossy_cg is False.
             ValueError: If the length of pair_idx is not equal to the number of pulsar pairs.            
         """
         # Pulsar positions
@@ -466,6 +498,12 @@ class anis_pta():
 
         Returns:
             np.ndarray: An array of ORF values for each pulsar pair.
+
+        Warning:
+            [Claude] Accuracy at high l_max. The c_lm -> power-map synthesis is
+            band-limited by nside: it is only accurate while l_max <= ~3*nside - 1
+            (conservatively l_max <= 2*nside). This band limit applies to both the
+            power and square-root bases.
         """
         # Using supplied clm values, calculate the corresponding power map
         # and calculate the ORF from that power map (convoluted, I know)
@@ -727,6 +765,18 @@ class anis_pta():
         Returns:
             tuple: A tuple of 4 np.ndarrays containing the clm values, the clm value errors,
                 the condition number of the Fisher matrix, and the singular values of the Fisher matrix.
+
+        Warning:
+            [Claude] Accuracy at high l_max (linear power basis). This estimator
+            fits the c_lm directly and does NOT use the square-root basis'
+            Clebsch-Gordan transform, so it is free of that cancellation issue.
+            It is, however, limited at high l_max by (1) the spherical-harmonic
+            band limit of the Gamma_lm basis, reliable only while
+            l_max <= ~3*nside - 1 (conservatively l_max <= 2*nside), and (2)
+            ill-conditioning of the spherical-harmonic Fisher matrix as the mode
+            count (l_max+1)**2 approaches the number of pulsar pairs -- the
+            returned condition number grows and the recovered c_lm rely
+            increasingly on regularization (cutoff / reg_type / alpha).
         """
         F_mat_clm = self.Gamma_lm.T
 
@@ -1013,6 +1063,16 @@ class anis_pta():
                     
         Returns:
             lmfit.Minimizer.minimize: The lmfit minimizer object for post-processing.
+
+        Warning:
+            [Claude] Accuracy at high l_max (square-root basis). This fit goes
+            through the b_lm -> c_lm Clebsch-Gordan transform, which loses accuracy
+            to float64 catastrophic cancellation as l_max grows: effectively exact
+            for l_max <= 63, tens-of-percent worst-case coefficient error by
+            l_max ~ 120, and refused above clebschGordan.SAFE_LMAX (=120) unless
+            the object was built with allow_lossy_cg=True. The basis is
+            additionally band-limited by nside (l_max <= ~3*nside - 1). Prefer
+            l_max <= 63 for high fidelity.
         """
         params = self.setup_lmfit_parameters() if params is None else params
 
