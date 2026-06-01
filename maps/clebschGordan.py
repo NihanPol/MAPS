@@ -4,6 +4,7 @@ from sympy.physics.quantum.cg import CG
 from collections import OrderedDict
 import os
 import math
+import warnings
 from scipy import sparse as sp
 
 # [Claude optimization] Optional numba acceleration for the high-l_max calc_beta
@@ -17,22 +18,43 @@ except Exception:
 
 # [Claude optimization] Numerical Clebsch-Gordan coefficient via the Racah
 # closed-form formula, used by clebschGordan.calc_beta in place of sympy's
-# symbolic CG(...).doit().evalf(). Verified to reproduce the symbolic result to
-# ~1e-16 absolute difference across l_max = 0..12 (exhaustive vs sympy). The
-# per-coefficient CG call is ~30-40x faster than sympy; calc_beta as a whole is
-# ~5x faster (l_max=6: ~3.1 s -> ~0.6 s) because it is still a Python triple
-# loop (49x16x16) -- after this change the loop, not the CG call, is the
-# dominant cost (a future vectorization could speed it up further). Integer
-# angular momenta only, which is all this module uses; returns 0.0 when the
-# selection rules are violated.
+# symbolic CG(...).doit().evalf(). The per-coefficient CG call is ~30-40x faster
+# than sympy. Integer angular momenta only, which is all this module uses;
+# returns 0.0 when the selection rules are violated.
 #
-# For very high l (l_max >= ~64) the product of factorials under the second sqrt
-# exceeds float64's max (~1.8e308) and the exact direct form raises OverflowError.
-# In that regime only, _cg_racah falls back to an overflow-safe log-space
-# evaluation (_cg_racah_logspace, accurate to ~1e-12 vs sympy). The exact direct
-# path is used everywhere it does not overflow, so all l_max <= ~63 results --
-# including every existing verified case -- are bit-for-bit unchanged.
+# ACCURACY (measured 2026-05-31 vs an mpmath dps>=50 Racah oracle, restricted to
+# the inputs calc_beta actually generates: l1,l2 <= blmax = l_max//2):
+#   * l_max <= 63 -- exact float64 path. Worst ~2e-12 relative; unchanged
+#     (bit-for-bit) from the previous committed evaluator. (NB: some stretched
+#     cells already use the log-space fallback below for l >~ 32, accurate to
+#     ~1e-12 -- so this is NOT bit-identical to arbitrary-precision sympy, only
+#     to the committed float64 evaluator.)
+#   * l_max 64..120 -- numba log-space path (_calc_beta_fast). Every all-m=0 CG
+#     (both the cg0 factor AND the m1=m2=0 cg1 factor) uses a CANCELLATION-FREE
+#     single-term closed form (_cg0_closed / _cg0_closed_fast, ~1e-13 at any l),
+#     so all-m=0 beta entries are near-exact. Only the cg1 factor with m1 or m2
+#     nonzero uses the alternating Racah k-sum, whose float64 catastrophic
+#     cancellation grows with l_max: worst meaningful-magnitude relative error
+#     ~1e-8 (l_max=64), ~1e-6 (100), ~1.7e-2 / ~2e-4 absolute (120, worst cell;
+#     typical ~1e-4).
+#   * l_max > SAFE_LMAX (=120) -- the cg1 k-sum loses too many bits (>~10% error
+#     by l_max~128, O(1)/sign-flipped by ~140), so clebschGordan REFUSES to build
+#     by default. Pass allow_lossy_cg=True to override (with a warning) if you
+#     knowingly accept the reduced accuracy.
+#
+# WARNING: do NOT reuse _cg_racah / _cg_racah_logspace / _cg_logspace_fast as a
+# general-purpose CG routine at high l -- for inputs with all three momenta near
+# l_max (which calc_beta never generates) they can lose >1e-4 absolute accuracy
+# to the same cancellation.
 from math import factorial as _fac, sqrt as _sqrt, lgamma as _lgamma, exp as _exp, log as _log
+
+# [Claude] Maximum l_max for which the sqrt-power-basis Clebsch-Gordan build is
+# trusted. Beyond this the general-m cg1 Racah k-sum suffers catastrophic float64
+# cancellation (see ACCURACY note above). clebschGordan raises for l_max > this
+# unless allow_lossy_cg=True. Calibrated against an mpmath oracle: worst
+# meaningful-magnitude cg1 error <=~1.7e-2 rel / 2e-4 abs at l_max=120, rising
+# steeply (>~10% by ~128, O(1) by ~140).
+SAFE_LMAX = 120
 
 
 def _cg_racah_logspace(j1, m1, j2, m2, J, M):
@@ -40,8 +62,10 @@ def _cg_racah_logspace(j1, m1, j2, m2, J, M):
 
     Used only when the exact direct factorial form would overflow float64. Works
     in log space (math.lgamma) and factors out the largest term of the alternating
-    k-sum for stability, so it never forms the huge intermediate factorials.
-    Accurate to ~1e-12 vs sympy; selection rules already checked by the caller.
+    k-sum for scale only -- this does NOT cure catastrophic cancellation. Accuracy
+    is good for calc_beta's inputs up to l_max~120 (worst ~2e-4 absolute) but
+    degrades sharply beyond (O(1)/sign-flipped by l_max~140); the SAFE_LMAX guard
+    in clebschGordan bounds the regime. Selection rules already checked by caller.
     """
     def _lf(n):
         return _lgamma(n + 1)
@@ -98,14 +122,44 @@ def _cg_racah(j1, m1, j2, m2, J, M):
         return _cg_racah_logspace(j1, m1, j2, m2, J, M)
 
 
+def _cg0_closed(l1, l2, L):
+    """Cancellation-free Clebsch-Gordan <l1 0 l2 0 | L 0> (integer l).
+
+    [Claude optimization] The all-m=0 reduced coefficient has a SINGLE-TERM closed
+    form (via the Wigner 3j with all m=0), so unlike the general Racah k-sum it has
+    NO alternating sum and therefore NO catastrophic cancellation. Evaluated in
+    log space it is accurate to ~1e-13 at any l_max. Returns 0.0 when the parity or
+    triangle selection rule is violated.
+
+        3j(l1 l2 L;0 0 0) = (-1)^g sqrt[(2g-2l1)!(2g-2l2)!(2g-2L)!/(2g+1)!]
+                            * g! / [(g-l1)!(g-l2)!(g-L)!],   g = (l1+l2+L)/2
+        <l1 0 l2 0|L 0>    = (-1)^(l1-l2) sqrt(2L+1) * 3j(l1 l2 L;0 0 0)
+    """
+    l1, l2, L = int(l1), int(l2), int(L)
+    if (l1 + l2 + L) % 2:
+        return 0.0
+    if L < abs(l1 - l2) or L > l1 + l2:
+        return 0.0
+    g2 = l1 + l2 + L
+    g = g2 // 2
+    log_mag = (0.5 * (_lgamma(g2 - 2*l1 + 1) + _lgamma(g2 - 2*l2 + 1)
+                      + _lgamma(g2 - 2*L + 1) - _lgamma(g2 + 2))
+               + _lgamma(g + 1) - _lgamma(g - l1 + 1) - _lgamma(g - l2 + 1) - _lgamma(g - L + 1))
+    threej = ((-1) ** g) * _exp(log_mag)
+    return ((-1) ** (l1 - l2)) * _sqrt(2 * L + 1) * threej
+
+
 if _HAVE_NUMBA:
 
     @_njit(cache=True, inline='always')
     def _cg_logspace_fast(j1, m1, j2, m2, J, M, lf):
         # [Claude optimization] numba log-space Clebsch-Gordan using a precomputed
-        # log-factorial table lf[n] = log(n!). Used only on the l_max>=64 fast
-        # path; ~1e-11 vs sympy (the float64 floor in that regime). The k-sum
-        # terms stay O(1)-bounded for CG, so no max-normalization is needed.
+        # log-factorial table lf[n] = log(n!). Used on the l_max>=64 fast path for
+        # the GENERAL-m cg1 only (the all-m=0 cg0 uses the cancellation-free
+        # _cg0_closed_fast below). The alternating k-sum suffers catastrophic
+        # float64 cancellation that grows with l: accuracy is ~1e-8 at l_max=64,
+        # ~2e-4 absolute at l_max=120, and O(1)/sign-flipped by ~140 -- so it is
+        # only used within the SAFE_LMAX (=120) regime that clebschGordan enforces.
         if M != m1 + m2:
             return 0.0
         if J < abs(j1 - j2) or J > j1 + j2:
@@ -125,6 +179,22 @@ if _HAVE_NUMBA:
             s += sk * math.exp(lp - ld)
         return s
 
+    @_njit(cache=True, inline='always')
+    def _cg0_closed_fast(l1, l2, L, lf):
+        # [Claude optimization] numba twin of _cg0_closed: cancellation-free
+        # single-term <l1 0 l2 0|L 0> via the all-m=0 Wigner 3j. ~1e-13 at any l.
+        if (l1 + l2 + L) % 2:
+            return 0.0
+        if L < abs(l1 - l2) or L > l1 + l2:
+            return 0.0
+        g2 = l1 + l2 + L
+        g = g2 // 2
+        log_mag = (0.5 * (lf[g2 - 2*l1] + lf[g2 - 2*l2] + lf[g2 - 2*L] - lf[g2 + 1])
+                   + lf[g] - lf[g - l1] - lf[g - l2] - lf[g - L])
+        sgn_g = 1.0 if (g % 2 == 0) else -1.0
+        sgn_ll = 1.0 if ((l1 - l2) % 2 == 0) else -1.0
+        return sgn_ll * math.sqrt(2.0 * L + 1.0) * sgn_g * math.exp(log_mag)
+
     @_njit(cache=True)
     def _calc_beta_fast(nfull, almax, blmax, l_arr, m_arr, almidx_arr, lf, four_pi):
         # [Claude optimization] numba sparse-beta builder for high l_max. cg0 is
@@ -139,7 +209,8 @@ if _HAVE_NUMBA:
                     lhi = almax
                 for L in range(abs(l1 - l2), lhi + 1):
                     if (l1 + l2 + L) % 2 == 0:
-                        cg0[l1, l2, L] = _cg_logspace_fast(l1, 0, l2, 0, L, 0, lf)
+                        # [Claude] cancellation-free closed form for the all-m=0 cg0
+                        cg0[l1, l2, L] = _cg0_closed_fast(l1, l2, L, lf)
         cnt = 0
         for jj in range(nfull):
             l1 = l_arr[jj]; m1 = m_arr[jj]
@@ -167,7 +238,14 @@ if _HAVE_NUMBA:
                     c0 = cg0[l1, l2, L]
                     if c0 == 0.0:
                         continue
-                    c1 = _cg_logspace_fast(l1, m1, l2, m2, L, M, lf)
+                    # [Claude] For the all-m=0 case, c1 == c0 = <l1 0 l2 0|L 0>, so
+                    # reuse the cancellation-free closed form (cg0) instead of the
+                    # lossy Racah k-sum -- these are the worst cancellation cells at
+                    # high l (e.g. (60,0,60,0,66,0) at l_max=120 was ~5e-3 wrong).
+                    if m1 == 0 and m2 == 0:
+                        c1 = c0
+                    else:
+                        c1 = _cg_logspace_fast(l1, m1, l2, m2, L, M, lf)
                     if c1 == 0.0:
                         continue
                     val = math.sqrt((2 * l1 + 1) * (2 * l2 + 1) / (four_pi * (2 * L + 1))) * c0 * c1
@@ -185,10 +263,31 @@ class clebschGordan():
     Class with methods for manipulating clebsch-gordon coeffcients.
     '''
 
-    def __init__(self, l_max, cache_dir=None, beta_dense_max_bytes=2_000_000_000):
+    def __init__(self, l_max, cache_dir=None, beta_dense_max_bytes=2_000_000_000,
+                 allow_lossy_cg=False):
 
         self.almax = int(l_max)
         self.blmax = int(self.almax / 2.)  #CG selection rule to ensure positive power across all sky
+
+        # [Claude] Cancellation guard. For l_max > SAFE_LMAX the general-m cg1
+        # Clebsch-Gordan k-sum loses too many bits to catastrophic float64
+        # cancellation (see the ACCURACY note at the top of this module), so the
+        # resulting beta -> sky map would be silently wrong. Refuse by default;
+        # allow_lossy_cg=True overrides with a warning for callers who knowingly
+        # accept the reduced accuracy.
+        if self.almax > SAFE_LMAX:
+            msg = ("clebschGordan(l_max=%d) exceeds SAFE_LMAX=%d: the general-m "
+                   "Clebsch-Gordan coefficients are computed by a Racah k-sum whose "
+                   "float64 catastrophic cancellation makes them untrustworthy at "
+                   "this l_max (worst meaningful-cell error ~%s by l_max~128, "
+                   "O(1)/sign-flipped by ~140). " % (self.almax, SAFE_LMAX, "10%"))
+            if not allow_lossy_cg:
+                raise ValueError(
+                    msg + "Pass allow_lossy_cg=True to build anyway and accept the "
+                    "reduced accuracy, or use a lower l_max.")
+            warnings.warn(
+                msg + "Proceeding because allow_lossy_cg=True; the recovered power "
+                "map / likelihood may be inaccurate at high l.", stacklevel=2)
 
         ## size of arrays: for blms its only non-negative m values but for alms it is all of them
         self.alm_size = (self.almax + 1)**2
@@ -282,10 +381,21 @@ class clebschGordan():
         # [Claude optimization] High-l_max fast path. For l_max >= 64 the exact
         # big-integer Racah CG is impractically slow AND overflows float64 for
         # many cells, so use a numba-compiled log-space builder (~150x faster:
-        # l_max=64 303s->2s, l_max=70 516s->3s). Accuracy ~1e-11 vs sympy -- the
-        # float64 floor where the exact form cannot run anyway. l_max <= 63 keeps
-        # the exact path below, so every existing verified result is unchanged.
+        # l_max=64 303s->2s, l_max=70 516s->3s). cg0 is the cancellation-free
+        # closed form (~1e-13); the general-m cg1 is the log-space Racah k-sum,
+        # accurate to ~1e-8 (l_max=64) .. ~2e-4 absolute (l_max=120) and guarded
+        # above SAFE_LMAX by __init__. l_max <= 63 keeps the exact path below, so
+        # every existing verified result there is unchanged (bit-for-bit).
         if _HAVE_NUMBA and self.almax >= 64:
+            # [Claude] The numba builder stores COO column indices (jj*nfull+kk,
+            # max nfull**2-1) as int32; mirror the non-numba path's int64 guard so
+            # we never silently overflow. nfull**2 < 2**31 holds for l_max < ~430,
+            # far above SAFE_LMAX, so this only matters with allow_lossy_cg=True.
+            if nfull * nfull >= 2 ** 31:
+                raise ValueError(
+                    "calc_beta numba path stores int32 column indices and would "
+                    "overflow at l_max=%d (nfull**2=%d >= 2**31). Such an l_max is "
+                    "computationally infeasible here anyway." % (self.almax, nfull * nfull))
             _lm = np.array([self.idxtoalm(self.blmax, j) for j in range(nfull)], dtype=np.int64)
             l_arr = np.ascontiguousarray(_lm[:, 0])
             m_arr = np.ascontiguousarray(_lm[:, 1])

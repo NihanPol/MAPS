@@ -201,7 +201,12 @@ def mapFromClm_fast(clm, nside):
     maxl = int(np.sqrt(len(clm))) - 1
     alm = almFromClm(clm)
 
-    h = hp.alm2map(alm, nside, maxl, verbose=False)
+    # [Claude] Dropped the verbose=False kwarg: 'verbose' was deprecated in healpy
+    # 1.15 (emitting a HealpyDeprecationWarning) and is removed in newer healpy,
+    # where passing it raises TypeError. It is a no-op on current healpy, so this
+    # is numerically identical and forward-compatible. (setup.py pins no healpy
+    # ceiling, so a fresh install can pull a healpy that removed it.)
+    h = hp.alm2map(alm, nside, maxl)
 
     return h
 

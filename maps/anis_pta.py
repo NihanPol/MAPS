@@ -75,7 +75,7 @@ class anis_pta():
     def __init__(self, psrs_theta, psrs_phi, xi = None, rho = None, sig = None,
                  os = None, pair_cov = None, l_max = 6, nside = 2, mode = 'power_basis',
                  use_physical_prior = False, include_pta_monopole = False,
-                 pair_idx = None, beta_cache_dir = None):
+                 pair_idx = None, beta_cache_dir = None, allow_lossy_cg = False):
         """Constructor for the anis_pta class.
 
         This function will construct an instance of the anis_pta class. This class
@@ -172,8 +172,11 @@ class anis_pta():
         if self.mode == 'sqrt_power_basis':
             # [Claude optimization] beta_cache_dir (opt-in, default None) enables
             # the on-disk sparse-beta cache keyed by l_max.
+            # [Claude] allow_lossy_cg (default False) is forwarded to the guard in
+            # clebschGordan: l_max > clebschGordan.SAFE_LMAX raises unless set True.
             self.sqrt_basis_helper = CG.clebschGordan(l_max = self.l_max,
-                                                      cache_dir = beta_cache_dir)
+                                                      cache_dir = beta_cache_dir,
+                                                      allow_lossy_cg = allow_lossy_cg)
         else:
             self.sqrt_basis_helper = None
         #self.reorder, self.neg_idx, self.zero_idx, self.pos_idx = self.reorder_hp_ylm()

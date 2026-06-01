@@ -10,10 +10,12 @@ setup(
     packages=['maps'],
     # Needed for dependencies
     # [Claude optimization] 'numba' added: it backs the high-l_max (>=64) calc_beta
-    # fast path (clebschGordan). It is imported behind a guard, so its absence only
-    # disables that acceleration (the exact path still works). The previous
-    # (undeclared) 'enterprise' dependency is gone -- anis_coefficients is now
-    # vendored into maps/anis_coefficients.py.
+    # fast path (clebschGordan). It is imported behind a guard; without it, l_max<=63
+    # still works via the exact Python path, but l_max>=64 falls back to a pure-Python
+    # log-space builder that is far slower and (like the numba path) loses accuracy to
+    # Clebsch-Gordan cancellation as l_max grows -- the clebschGordan.SAFE_LMAX guard
+    # bounds that regime either way. The previous (undeclared) 'enterprise' dependency
+    # is gone -- anis_coefficients is now vendored into maps/anis_coefficients.py.
     install_requires=['numpy', 'scipy', 'sympy', 'astroML', 'PTMCMCSampler', 'healpy', 'lmfit', 'numba'],
     # *strongly* suggested for sharing
     version='0.4.2',
