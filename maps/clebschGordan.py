@@ -29,14 +29,16 @@ except Exception:
 #     cells already use the log-space fallback below for l >~ 32, accurate to
 #     ~1e-12 -- so this is NOT bit-identical to arbitrary-precision sympy, only
 #     to the committed float64 evaluator.)
-#   * l_max 64..120 -- numba log-space path (_calc_beta_fast). Every all-m=0 CG
-#     (both the cg0 factor AND the m1=m2=0 cg1 factor) uses a CANCELLATION-FREE
-#     single-term closed form (_cg0_closed / _cg0_closed_fast, ~1e-13 at any l),
-#     so all-m=0 beta entries are near-exact. Only the cg1 factor with m1 or m2
-#     nonzero uses the alternating Racah k-sum, whose float64 catastrophic
-#     cancellation grows with l_max: worst meaningful-magnitude relative error
-#     ~1e-8 (l_max=64), ~1e-6 (100), ~1.7e-2 / ~2e-4 absolute (120, worst cell;
-#     typical ~1e-4).
+#   * l_max 64..120 -- numba log-space path (_calc_beta_fast), or the Python
+#     loop when numba is unavailable. In BOTH builders every all-m=0 CG (both
+#     the cg0 factor AND the m1=m2=0 cg1 factor) uses a CANCELLATION-FREE
+#     single-term closed form (_cg0_closed_fast in the numba kernel; the Python
+#     cg0 helper falls back to _cg0_closed when the exact factorial form
+#     overflows; ~1e-13 at any l), so all-m=0 beta entries are near-exact. Only
+#     the cg1 factor with m1 or m2 nonzero uses the alternating Racah k-sum,
+#     whose float64 catastrophic cancellation grows with l_max: worst
+#     meaningful-magnitude relative error ~1e-8 (l_max=64), ~1e-6 (100),
+#     ~1.7e-2 / ~2e-4 absolute (120, worst cell; typical ~1e-4).
 #   * l_max > SAFE_LMAX (=120) -- the cg1 k-sum loses too many bits (>~10% error
 #     by l_max~128, O(1)/sign-flipped by ~140), so clebschGordan REFUSES to build
 #     by default. Pass allow_lossy_cg=True to override (with a warning) if you
@@ -86,8 +88,14 @@ def _cg_racah_logspace(j1, m1, j2, m2, J, M):
     return ksum * _exp(lmx)
 
 
-def _cg_racah(j1, m1, j2, m2, J, M):
-    """Clebsch-Gordan coefficient <j1 m1 j2 m2 | J M> (integer spins)."""
+def _cg_racah_exact(j1, m1, j2, m2, J, M):
+    """Exact-factorial Clebsch-Gordan <j1 m1 j2 m2 | J M> (integer spins).
+
+    [Claude fix] Split out of _cg_racah so callers can pick their own overflow
+    fallback: raises OverflowError when the factorial products exceed float64
+    (high l). _cg_racah falls back to the log-space k-sum (general m); the
+    calc_beta cg0 helper falls back to the cancellation-free _cg0_closed.
+    """
     # [Claude optimization] Cast to Python int up front. calc_beta passes
     # numpy.int64 indices (from healpy Alm.getlm via idxtoalm); numpy integer
     # arithmetic on the factorial products below silently overflows int64 and
@@ -100,24 +108,29 @@ def _cg_racah(j1, m1, j2, m2, J, M):
         return 0.0
     if abs(m1) > j1 or abs(m2) > j2 or abs(M) > J:
         return 0.0
+    pref = _sqrt((2 * J + 1)
+                 * _fac(j1 + j2 - J) * _fac(j1 - j2 + J) * _fac(-j1 + j2 + J)
+                 / _fac(j1 + j2 + J + 1))
+    pref *= _sqrt(_fac(J + M) * _fac(J - M) * _fac(j1 - m1) * _fac(j1 + m1)
+                  * _fac(j2 - m2) * _fac(j2 + m2))
+    ksum = 0.0
+    kmin = max(0, j2 - J - m1, j1 - J + m2)
+    kmax = min(j1 + j2 - J, j1 - m1, j2 + m2)
+    for k in range(kmin, kmax + 1):
+        ksum += ((-1) ** k) / (
+            _fac(k) * _fac(j1 + j2 - J - k) * _fac(j1 - m1 - k)
+            * _fac(j2 + m2 - k) * _fac(J - j2 + m1 + k) * _fac(J - j1 - m2 + k))
+    return pref * ksum
+
+
+def _cg_racah(j1, m1, j2, m2, J, M):
+    """Clebsch-Gordan coefficient <j1 m1 j2 m2 | J M> (integer spins)."""
     # [Claude optimization] Exact direct factorial form. For very high l the
     # second sqrt's factorial product exceeds float64's max -> OverflowError; in
     # that case only, fall back to the overflow-safe log-space evaluation. The
     # try has zero cost when no overflow occurs, so low-l results are unchanged.
     try:
-        pref = _sqrt((2 * J + 1)
-                     * _fac(j1 + j2 - J) * _fac(j1 - j2 + J) * _fac(-j1 + j2 + J)
-                     / _fac(j1 + j2 + J + 1))
-        pref *= _sqrt(_fac(J + M) * _fac(J - M) * _fac(j1 - m1) * _fac(j1 + m1)
-                      * _fac(j2 - m2) * _fac(j2 + m2))
-        ksum = 0.0
-        kmin = max(0, j2 - J - m1, j1 - J + m2)
-        kmax = min(j1 + j2 - J, j1 - m1, j2 + m2)
-        for k in range(kmin, kmax + 1):
-            ksum += ((-1) ** k) / (
-                _fac(k) * _fac(j1 + j2 - J - k) * _fac(j1 - m1 - k)
-                * _fac(j2 + m2 - k) * _fac(J - j2 + m1 + k) * _fac(J - j1 - m2 + k))
-        return pref * ksum
+        return _cg_racah_exact(j1, m1, j2, m2, J, M)
     except OverflowError:
         return _cg_racah_logspace(j1, m1, j2, m2, J, M)
 
@@ -284,7 +297,8 @@ class clebschGordan():
             l_max (int): Maximum multipole of the (clm) power map; the sqrt
                 parameters run to blmax = l_max // 2.
             cache_dir (str, optional): If given, the sparse beta matrix is cached
-                to / loaded from this directory (keyed by l_max). Default None.
+                to / loaded from this directory (keyed by l_max, the builder
+                path -- numba vs exact -- and a values version). Default None.
             beta_dense_max_bytes (int): Byte budget above which the dense
                 ``beta_vals`` property refuses to materialize (default ~2 GB).
             allow_lossy_cg (bool): Permit construction above SAFE_LMAX despite the
@@ -413,7 +427,8 @@ class clebschGordan():
 
         nfull = 2 * self.blm_size - self.blmax - 1
 
-        # Opt-in disk cache, keyed by l_max.
+        # Opt-in disk cache, keyed by l_max + builder path + values version
+        # (see _beta_cache_path).
         if self._cache_dir is not None and os.path.exists(self._beta_cache_path()):
             self._beta_csr = sp.load_npz(self._beta_cache_path())
             self._beta_shape = (self.alm_size, nfull, nfull)
@@ -465,11 +480,22 @@ class clebschGordan():
         lm = [self.idxtoalm(self.blmax, j) for j in range(nfull)]
 
         # cg0(l1, l2, L) depends only on (l1, l2, L); cache it.
+        # [Claude fix] Accuracy parity with the numba fast path: keep the exact
+        # factorial form wherever it does not overflow (bit-for-bit unchanged at
+        # l_max <= 63), but when it overflows at high l fall back to the
+        # CANCELLATION-FREE closed form _cg0_closed -- not the lossy log-space
+        # Racah k-sum. Previously, running without numba at l_max >= 64 sent
+        # these worst-cancellation all-m=0 cells through the lossy k-sum
+        # (~1e-8 error at l_max=64, ~5e-3 by 120), so results silently depended
+        # on whether numba was importable.
         cg0_cache = {}
         def cg0(l1, l2, L):
             v = cg0_cache.get((l1, l2, L))
             if v is None:
-                v = _cg_racah(l1, 0, l2, 0, L, 0)
+                try:
+                    v = _cg_racah_exact(l1, 0, l2, 0, L, 0)
+                except OverflowError:
+                    v = _cg0_closed(l1, l2, L)
                 cg0_cache[(l1, l2, L)] = v
             return v
 
@@ -497,7 +523,14 @@ class clebschGordan():
                     c0 = cg0(l1, l2, L)
                     if c0 == 0.0:
                         continue
-                    c1 = _cg_racah(l1, m1, l2, m2, L, M)
+                    # [Claude fix] For all-m=0 cells c1 == c0 = <l1 0 l2 0|L 0>;
+                    # reuse it. Identical value to the previous _cg_racah call at
+                    # low l (same function, same cache), and at high l it carries
+                    # the cancellation-free fallback -- mirroring the numba kernel.
+                    if m1 == 0 and m2 == 0:
+                        c1 = c0
+                    else:
+                        c1 = _cg_racah(l1, m1, l2, m2, L, M)
                     if c1 == 0.0:
                         continue
                     val = np.sqrt((2*l1 + 1) * (2*l2 + 1) / (four_pi * (2*L + 1))) * c0 * c1
@@ -529,8 +562,17 @@ class clebschGordan():
             sp.save_npz(self._beta_cache_path(), self._beta_csr)
 
     def _beta_cache_path(self):
-        # [Claude optimization] cache filename keyed by l_max (+ format version).
-        return os.path.join(self._cache_dir, "maps_beta_lmax%d_v1.npz" % self.almax)
+        # [Claude fix] cache filename keyed by l_max AND the builder that
+        # produced the values ('numba' log-space fast path vs 'exact' Python
+        # loop), plus a values version. The two builders give (slightly)
+        # different floats at the same l_max >= 64, so the previous
+        # l_max-only key could silently serve one builder's values to the
+        # other -- e.g. a lossy high-l cache being reused after numba is
+        # (un)installed. v2 also marks the cancellation-free cg0 fallback in
+        # the exact path; stale *_v1.npz files are ignored and recomputed.
+        builder = 'numba' if (_HAVE_NUMBA and self.almax >= 64) else 'exact'
+        return os.path.join(self._cache_dir,
+                            "maps_beta_lmax%d_%s_v2.npz" % (self.almax, builder))
 
     @property
     def beta_vals(self):
