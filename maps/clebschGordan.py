@@ -470,6 +470,21 @@ class clebschGordan():
                 sp.save_npz(self._beta_cache_path(), self._beta_csr)
             return
 
+        # [Claude fix] numba is a declared dependency (setup.py) and backs the
+        # l_max >= 64 fast path; the import guard above exists only so broken
+        # numba installs degrade gracefully instead of breaking `import maps`.
+        # Make that degradation LOUD: the pure-Python builder is ~150x slower
+        # here, and its floats differ from the numba builder's at the ~1e-9
+        # level (it is the slightly more accurate of the two; the disk cache
+        # keys the builders separately).
+        if self.almax >= 64 and not _HAVE_NUMBA:
+            warnings.warn(
+                "clebschGordan(l_max=%d): numba is not importable, so calc_beta "
+                "is using the pure-Python builder (~150x slower at this l_max; "
+                "numerically equivalent to ~1e-9). numba is a declared "
+                "dependency of MAPS -- check your installation." % self.almax,
+                stacklevel=2)
+
         # (L, M) -> alm index, in the extended ordering used by idxtoalm.
         almidx_of = {}
         for ii in range(self.alm_size):
