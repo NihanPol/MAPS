@@ -115,7 +115,9 @@ class anis_pta():
             band-limited by the pixelization: it is only reliable while
             l_max <= ~3*nside - 1 (a conservative choice is l_max <= 2*nside).
             Raising l_max without a correspondingly larger nside aliases the basis
-            and degrades both 'power_basis' and 'sqrt_power_basis' results. The
+            and degrades both 'power_basis' and 'sqrt_power_basis' results;
+            [Claude] construction now emits a UserWarning when
+            l_max > 3*nside - 1. The
             'power_basis' linear inversion (see max_lkl_clm) additionally becomes
             ill-conditioned as the mode count (l_max+1)**2 approaches the number
             of pulsar pairs.
@@ -192,7 +194,32 @@ class anis_pta():
             warnings.warn("Using Pixel basis. Some features/attributes/methods may not work!")
         else:
             raise ValueError("mode must be either 'pixel', 'power_basis','sqrt_power_basis' or 'hybrid'")
-        
+
+        # [Claude fix] Enforce (as a warning) the spherical-harmonic band limit
+        # that was previously only documented: Gamma_lm is built from the healpy
+        # SHT of the pair response maps and is band-limited by the pixelization,
+        # so it is only reliable while l_max <= ~3*nside - 1 (see the class
+        # docstring Warnings). This applies to EVERY spherical-harmonic mode
+        # (power_basis, sqrt_power_basis, hybrid) -- previously only the sqrt
+        # basis had a (different, CG-related) guard, so e.g. power_basis at high
+        # l_max / small nside built a silently aliased basis. A warning (not an
+        # error) preserves backward compatibility.
+        if self.mode != 'pixel' and self.l_max > 3 * self.nside - 1:
+            warnings.warn(
+                "anis_pta(l_max=%d, nside=%d): l_max exceeds the pixelization "
+                "band limit ~3*nside-1 = %d, so the spherical-harmonic basis "
+                "(Gamma_lm) is aliased and results will be degraded in ALL "
+                "spherical-harmonic modes. Increase nside (so that "
+                "l_max <= 3*nside-1) or lower l_max."
+                % (self.l_max, self.nside, 3 * self.nside - 1), stacklevel=2)
+
+        # [Claude fix] Remember the CG-helper construction options so internal
+        # re-constructions (e.g. the l_max=0 isotropic null model built by
+        # utils.signal_to_noise) can forward them instead of silently dropping
+        # them.
+        self.beta_cache_dir = beta_cache_dir
+        self.allow_lossy_cg = bool(allow_lossy_cg)
+
         # [Claude optimization] Building the Clebsch-Gordan helper triggers an
         # expensive symbolic-sympy precompute (clebschGordan.calc_beta, ~3 s at
         # l_max=6) that is ONLY used by the square-root power basis. The other

@@ -160,11 +160,18 @@ def signal_to_noise(pta, lm_params = None, pair_cov = False, method = 'leastsq')
     else:
         lm_out = lm_params
 
-    iso_pta = ap.anis_pta(pta.psrs_theta, pta.psrs_phi, pta.xi, pta.rho, pta.sig, 
-                 os = 1, pair_cov = pta.pair_cov, l_max = 0, nside = pta.nside, 
-                 mode = pta.mode, use_physical_prior = pta.use_physical_prior, 
-                 include_pta_monopole = pta.include_pta_monopole, 
-                 pair_idx = pta.pair_idx) #OS already applied in pta
+    # [Claude fix] Forward the CG-helper construction options from the parent
+    # pta (they were previously dropped here). At l_max=0 they are near no-ops
+    # today (the beta build is trivial and SAFE_LMAX cannot trip), but dropping
+    # them silently made this internal construction site diverge from the
+    # parent's configuration.
+    iso_pta = ap.anis_pta(pta.psrs_theta, pta.psrs_phi, pta.xi, pta.rho, pta.sig,
+                 os = 1, pair_cov = pta.pair_cov, l_max = 0, nside = pta.nside,
+                 mode = pta.mode, use_physical_prior = pta.use_physical_prior,
+                 include_pta_monopole = pta.include_pta_monopole,
+                 pair_idx = pta.pair_idx,
+                 beta_cache_dir = getattr(pta, 'beta_cache_dir', None),
+                 allow_lossy_cg = getattr(pta, 'allow_lossy_cg', False)) #OS already applied in pta
     
     if pta.mode == 'sqrt_power_basis':
         lm_out_iso = iso_pta.max_lkl_sqrt_power(pair_cov=pair_cov,method=method)
