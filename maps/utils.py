@@ -241,7 +241,7 @@ def angular_power_spectrum(clm, clm_err = None):
     C_l = np.zeros((maxl + 1))
     idx = 0
     if clm_err is not None:
-        C_l_err = np.zeros((maxl))
+        C_l_err = np.zeros((maxl + 1))
 
     for ll in range(maxl+1):
         if ll == 0:
