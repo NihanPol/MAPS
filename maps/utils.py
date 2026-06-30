@@ -235,29 +235,28 @@ def signal_to_noise(pta, lm_params = None, pair_cov = False, method = 'leastsq')
 
 def angular_power_spectrum(clm, clm_err = None):
 
-    maxl = int(np.sqrt(clm.shape[0]))
-    new_clm2 = clm ** 2
+    maxl = int(np.sqrt(clm.shape[0])) - 1
+    clm2 = clm ** 2
 
-    C_l = np.zeros((maxl))
+    C_l = np.zeros((maxl + 1))
+    idx = 0
     if clm_err is not None:
         C_l_err = np.zeros((maxl))
-    
-    idx = 0
 
-    for ll in range(maxl):
+    for ll in range(maxl+1):
         if ll == 0:
-            C_l[ll] = new_clm2[ll]
+            C_l[ll] = clm2[ll]
             if clm_err is not None:
-                C_l_err[ll] = np.sqrt(4 * new_clm2[ll] * clm_err[ll] ** 2)
+                C_l_err[ll] = np.sqrt(4 * clm2[ll] * clm_err[ll] ** 2)
             idx += 1
         else:
-            subset_len = 2 * ll + 1
+            subset_len = 2*ll + 1
             subset = np.arange(idx, idx + subset_len)
 
-            C_l[ll] = np.sum(new_clm2[subset]) / (2 * ll + 1)
+            C_l[ll] = np.sum(clm2[subset]) / (2 * ll + 1)
             if clm_err is not None:
-                C_l_err[ll] = np.sqrt(np.sum(4 * new_clm2[subset] * clm_err[subset] / (2 * ll + 1)))
-            idx = subset[-1]
+                C_l_err[ll] = np.sqrt(np.sum(4 * clm2[subset] * clm_err[subset] / (2 * ll + 1)))
+            idx = subset[-1] + 1
 
     if clm_err is not None:
         return C_l, C_l_err
