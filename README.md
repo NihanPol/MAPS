@@ -1,6 +1,6 @@
 # MApping the PTA sky (MAPS)
 
-A Python package by Nihan Pol, MAPS aims to simplify the task of searching for anisotropies in the nanohertz gravitational wave sky observed with PTAs. 
+A PTA community developed and maintained Python package that aims to simplify the task of searching for anisotropies in the nanohertz gravitational wave sky observed with PTAs. 
 
 ## Installation
 
