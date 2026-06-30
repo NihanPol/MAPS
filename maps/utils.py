@@ -255,7 +255,7 @@ def angular_power_spectrum(clm, clm_err = None):
 
             C_l[ll] = np.sum(clm2[subset]) / (2 * ll + 1)
             if clm_err is not None:
-                C_l_err[ll] = np.sqrt(np.sum(4 * clm2[subset] * clm_err[subset] / (2 * ll + 1)))
+                C_l_err[ll] = np.sqrt(np.sum(4 * clm2[subset] * clm_err[subset] ** 2 / (2 * ll + 1) ** 2))
             idx = subset[-1] + 1
 
     if clm_err is not None:
