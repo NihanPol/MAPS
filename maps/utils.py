@@ -14,8 +14,16 @@ import scipy.linalg as sl
 from . import clebschGordan as CG
 from . import anis_pta as ap
 
+try:
+    from scipy.integrate import trapz
+except ImportError:
+    from scipy.integrate import trapezoid as trapz
+
 from scipy.interpolate import interp1d
 from astroML.linear_model import LinearRegression
+
+import tqdm
+import random
 
 
 def invert_omega(hp_map):
@@ -230,19 +238,15 @@ def draw_random_sample(ip_arr, bins = 50, nsamp = 10):
     return interp_func(rn_draw)
 
 
-def posterior_sampled_Cl_skymap(anis_pta, chain, burn = 0, n_draws = 100):
-    """A function to generate posterior sampled sky maps from a chain file.
+def posterior_sampled_skymap_Cl_orf(anis_pta, data, n_draws=100):
 
-    Return collection of sky maps randomly drawn from posterior
-    given an (emcee) chain file sampling the posterior around the
-    maximum likelihood value.
+    """ A method to get a posterior sampled skymap, orf and Cl from a chain.
+    This method works with all basis.
 
     Args:
         anis_pta (anis_pta.anis_pta): The anisotropic PTA object
-        chain (pd.DataFrame): chain file with posterior samples with rows = samples, params = columns
-        burn (int, optional): burn-in length. Defaults to 0.
-        n_draws (int): number of draws from chain file to generate the posterior averaged sky map.
-            Defaults to 100.
+        data (np.ndarray): The posterior samples from the chain file of shape (npars x nsamples)
+        n_draws (int): number of draws from chain file. Defaults to 100.
 
     Returns:
         tuple: A tuple containing:
@@ -250,37 +254,154 @@ def posterior_sampled_Cl_skymap(anis_pta, chain, burn = 0, n_draws = 100):
                 to n_draws from posterior.
             Cl (np.ndarray): (n_draws x n_Cl) numpy array of C_l values corresponding 
                 to n_draws from posterior.
+            orf (np.ndarray): (n_draws x n_cc) numpy array of orf values corresponding 
+                to n_draws from posterior.
+
     """
 
-    chain_copy = chain.copy()
+    pow_map = np.zeros(shape=(n_draws, hp.pixelfunc.nside2npix(anis_pta.nside)))
+    Cl = np.zeros(shape=(n_draws, anis_pta.l_max+1))
+    orf = np.zeros(shape=(n_draws, anis_pta.npairs))
 
-    if anis_pta.include_pta_monopole:
-        chain_copy.insert(loc = 2, column = 'b_00', value = 1)
-    else:
-        chain_copy.insert(loc = 1, column = 'b_00', value = 1)
+    rand_idx = random.sample(population=range(data.shape[1]), k=n_draws)
 
-    sub_chain = chain_copy.sample(n = n_draws)
+    if anis_pta.mode == 'hybrid':
 
-    pow_maps = np.full((n_draws, hp.pixelfunc.nside2npix(anis_pta.nside)), 0.0)
-    post_Cl = np.full((n_draws, anis_pta.l_max + 1), 0.0)
+        for i,n in enumerate(tqdm.tqdm(rand_idx, desc='n_draw')):
+            if anis_pta.activate_A2_pixel:
+                pow_map[i] = (10**data[0][n]) * (10**data[1:, n])
+                clm_from_map = ac.clmFromMap_fast(h=pow_map[i], lmax=anis_pta.l_max)
+                orf[i] = (10**data[0][n]) * anis_pta.orf_from_clm(params=clm_from_map, 
+                                                                  include_scale=False)
+            else:
+                pow_map[i] = 10**data[:, n]
+                clm_from_map = ac.clmFromMap_fast(h=pow_map[i], lmax=anis_pta.l_max)
+                orf[i] = anis_pta.orf_from_clm(params=clm_from_map, 
+                                               include_scale=False)
 
-    for ii in range(n_draws):
+            Cl[i] = angular_power_spectrum(clm=clm_from_map)
 
-        if anis_pta.include_pta_monopole:
-            clms = convert_blm_params_to_clm(anis_pta, sub_chain.iloc[ii, 2:])
-        else:
-            clms = convert_blm_params_to_clm(anis_pta, sub_chain.iloc[ii, 1:])
+    
+    elif anis_pta.mode == 'power_basis':
+        
+        for i,n in enumerate(tqdm.tqdm(rand_idx, desc='n_draw')):
+            pow_map[i] = (10**data[0][n]) * ac.mapFromClm(clm=[np.sqrt(4*np.pi), *data[1:, n]], nside=anis_pta.nside)
+            Cl[i] = angular_power_spectrum(clm=np.array([np.sqrt(4*np.pi), *data[1:, n]]))
+            orf[i] = (10**data[0][n]) * anis_pta.orf_from_clm(params=np.array([np.sqrt(4*np.pi), *data[1:, n]]), 
+                                                              include_scale=False)
 
-        Cl = angular_power_spectrum(anis_pta, clms)
+    
+    elif anis_pta.mode == 'sqrt_power_basis':
+        
+        for i,n in enumerate(tqdm.tqdm(rand_idx, desc='n_draw')):
+            blm_to_clm = convert_blm_params_to_clm(anis_pta, [1.0, *data[1:, n]])
+            
+            pow_map[i] = (10**data[0][n]) * ac.mapFromClm(clm=blm_to_clm, nside=anis_pta.nside)
+            Cl[i] = angular_power_spectrum(clm=blm_to_clm)
+            orf[i] = (10**data[0][n]) * anis_pta.orf_from_clm(params=blm_to_clm, 
+                                                              include_scale=False)
 
-        if anis_pta.include_pta_monopole:
-            pow_maps[ii] = (10 ** sub_chain.iloc[ii, 1]) * ac.mapFromClm(clms, nside = anis_pta.nside)
-        else:
-            pow_maps[ii] = (10 ** sub_chain.iloc[ii, 0]) * ac.mapFromClm(clms, nside = anis_pta.nside)
+    
+    return pow_map, Cl, orf
 
-        post_Cl[ii] = Cl
 
-    return pow_maps, post_Cl
+
+def bootstrap_1d(core, param, burn=0, realizations=1000, seed=316):
+    """
+    A handy function to get boostrapped samples of a parameter's posterior samples.
+
+    Args:
+        core (object) : A la_forge.core.Core object of the chain.
+        param (str) : The parameter name whose bootstrapped samples to compute.
+        burn (int, optional) : No. of samples to be treated as burn-in. Note: This
+                                is explicit to burn-in done while creating la_forge.core.Core object.
+                                Default is 0.
+        realizations (int, optional): No. of realizations for bootstrapping. Default is 1000.
+        seed (int, optional): For generating random draws of 'param' posterior samples during bootstrapping. 
+            Defaults to 316.
+
+    Returns:
+        bootstrapped (np.ndarray) : Bootstrapped samples of 'param' of shape (nrealizations x nsamples).
+
+    """ 
+    
+    rng = nr.default_rng(seed=seed)  # set up a random number generator
+    data = core.get_param(param)[burn:]
+    bootstraped = []
+
+    for n in tqdm.tqdm(range(realizations), desc='bootstrapping '+param):
+        bootstraped.append(data[rng.choice(len(data), size=len(data), replace=True)])
+    
+    return np.array(bootstraped)
+
+
+
+def get_BF_dist_hypermodel(pta_anis_hypermodel, core, burn=0, realizations=1000, seed=316):
+    """
+    A handy function to get Bayes' Factor distribution for hypermodel using 'nmodel' parameter.
+    This also re-weights the BF if pta_anis.log_weights is not None. Note that this function should
+    be used after checking for proper mixing of 'nmodel' from its traceplot.
+
+    Args:
+        pta_anis_hypermodel (anis_pta.anis_hypermodel) : The anis_pta hypermodel object used for inference.
+        core (object) : A la_forge.core.Core object of the chain.
+        burn (int, optional) : No. of samples to be treated as burn-in. Note: This
+                                is explicit to burn-in done while creating la_forge.core.Core object.
+                                Default is 0.
+        realizations (int, optional): No. of realizations for bootstrapping. Default is 1000.
+        seed (int, optional): For generating random draws of 'nmodel' posterior samples during bootstrapping. 
+            Defaults to 316.
+
+    Returns:
+        A dictionary : With key denoting which model/which model. Values corresponding to the BF distribution 
+                    including re-weighting.
+
+    """
+    
+    bootstrapped_nmodel = bootstrap_1d(core, 'nmodel', burn, realizations, seed)
+
+    nmodel_bins = [(i-0.5, i+0.5) for i in range(pta_anis_hypermodel.n_models)]
+    #bf_dist = np.zeros(realizations)
+    bf_dists = {f"{pta_anis_hypermodel.model_names[h]}/{pta_anis_hypermodel.model_names[l]}": np.zeros(realizations) 
+                for h in range(pta_anis_hypermodel.n_models) for l in range(h)}
+
+    for r in tqdm.tqdm(range(realizations), desc='Calc. BF dist.'):
+        # count samples per model
+        counts = []
+        for (low, high) in nmodel_bins:
+            mask = (bootstrapped_nmodel[r, :] > low) & (bootstrapped_nmodel[r, :] <= high)
+            counts.append(np.sum(mask))
+
+        # compute BF for h/l 
+        for h in range(pta_anis_hypermodel.n_models):
+            for l in range(h):
+                key = f"{pta_anis_hypermodel.model_names[h]}/{pta_anis_hypermodel.model_names[l]}"
+                # check if model1 has 0 counts as compared to model2.
+                if counts[l] > 0:
+                    if pta_anis_hypermodel.log_weights is not None:
+                        bf_dists[key][r] = (counts[h] / counts[l]) * (np.exp(pta_anis_hypermodel.log_weights[l])/np.exp(pta_anis_hypermodel.log_weights[h]))
+                    else:
+                        bf_dists[key][r] = counts[h] / counts[l]
+                else: 
+                    np.inf
+
+    return bf_dists
+
+    
+    #for r in tqdm.tqdm(range(realizations), desc='Calc. BF dist.'):
+    #    bf_dist[r] = (len(np.where((bootstrapped_nmodel[r, :] > 0.5) & (bootstrapped_nmodel[r, :] <= 1.5))[0]) / 
+    #                   len(np.where((bootstrapped_nmodel[r, :] > -0.5) & (bootstrapped_nmodel[r, :] <= 0.5))[0]))
+
+    #if pta_anis_hypermodel.log_weights is not None:
+        
+    #    lw_0 = np.exp(float(pta_anis_hypermodel.log_weights[0]))
+    #    lw_1 = np.exp(float(pta_anis_hypermodel.log_weights[1]))
+    #    lw = lw_0 / lw_1
+    #    return {pta_anis_hypermodel.model_names[1]+'/'+pta_anis_hypermodel.model_names[0] : bf_dist * lw}
+    
+    #else:
+    #    return {pta_anis_hypermodel.model_names[1]+'/'+pta_anis_hypermodel.model_names[0] : bf_dist}
+
 
 
 def woodbury_inverse(A, U, C, V, ret_cond = False):
@@ -317,3 +438,195 @@ def woodbury_inverse(A, U, C, V, ret_cond = False):
         return tot_inv, np.linalg.cond(CVAU)
     
     return tot_inv
+
+
+# A handy function to do some anisotropy injection stuff
+def inject_anisotropy(anis_pta, method, n_draws=1, sim_clms=None, sim_blms=None, sim_log10_A2=0.0, sim_sig=0.01, pair_cov=False, seed=316, 
+                      h=None, sim_power=50, sim_theta=np.pi/2, sim_phi=3*np.pi/2, lonlat=False, sim_pixel_radius=10, include_A2_pixel=False, norm_pixel=False, 
+                      clm_min=-3.0, clm_max=3.0, bl0_min=-3.0, bl0_max=3.0, blm_amp_min=1.0, blm_amp_max=3.0, blm_phase_min=0.5*np.pi, blm_phase_max=1.5*np.pi, 
+                      add_rand_noise=False, return_vals=False):
+
+    """ A handy function to create an anisotropy injected cross-correlated data. This function creates 'injected' instances of the anis_pta object.
+
+    Args:
+        anis_pta (object) : The anis_pta instance created by MAPS.
+        method (str): The method to use for creating the inject sky. 'power_basis' or 'pixel'. 
+            Defaults to 'power_basis'.
+        n_draws (int, optional): No. of noise realizations to generate when doing noise-marginalization/joint-noise-maximization tests. 
+            NM=1 denotes no noise draws. Defaults to 1.
+        sim_clms (list or np.ndarray, optional): The list or array of clm values to inject including c_00. Randomly generated if not specified. 
+            Default is None.
+        sim_blms (list or np.ndarray, optional): The list or array of blm values to inject with amplitude and phase seperated including b_00. 
+            Randomly generated if not specified. Default is None.
+        sim_log10_A2 (float, optional): The amplitude correction to assume. Defaults to 0.0
+        sim_sig (float, optional): The cross-correlation uncertainty to assume. 
+            Defaults to 0.01.
+        pair_cov (bool, optional): Whether to return the pair covariance matrix. 
+            Defaults to False.
+        seed (int, optional): The seed to be passed to numpy random number generator for 
+            creating clm's (method='power_basis' and sim_clms=None) or blm's (method='sqrt_power_basis' and sim_blms=None) 
+            or when adding random gaussian noise to cross-correlations. Defaults to 316.
+        sim_power (int ot float, optional): The power of anisotropy to inject in the sky for 'pixel' method. 
+            Defaults to 50.
+        sim_theta, sim_phi (int or float, optional): The location of injection for 'pixel' method. 
+            Defaults to pi/2, 3pi/2 respectively.
+        lonlat (bool, optional): Whether to consider sim_theta and sim_phi as longitude and latitude. Defaults to False.
+        sim_pixel_radius (int or float, optional): The size of the pixel injection for 'pixel' method. 
+            Defaults to 10.
+        include_A2_pixel (bool, optional): Whether to include th amplitude correction parameter in pixel basis.
+            Default is False.
+        norm_pixel (bool, optional): Whether to normalize the pixel power-map. Default is False.
+        clm_min (float, optional): Minimum boundary for clm's to draw a random value from when method='power_basis' and 
+            sim_clms=None. Defaults to -3.0.
+        clm_max (float, optional): Maximum boundary for clm's to draw a random value from when method='power_basis' and 
+            sim_clms=None. Defaults to 3.0.
+        bl0_min (float, optional): Minimum boundary for bl0's to draw a random value from when method='sqrt_power_basis' and 
+            sim_blms=None. Defaults to -3.0.
+        bl0_max (float, optional): Maximum boundary for bl0's to draw a random value from when method='sqrt_power_basis' and 
+            sim_blms=None. Defaults to 3.0.
+        blm_amp_min (float, optional): Minimum boundary for blm amplitudes to draw a random value from when method='sqrt_power_basis' and 
+            sim_blms=None. Defaults to 1.0.
+        blm_amp_max (float, optional): Maximum boundary for blm amplitudes to draw a random value from when method='sqrt_power_basis' and 
+            sim_blms=None. Defaults to 3.0.
+        blm_phase_min (float, optional): Minimum boundary for blm phases to draw a random value from when method='sqrt_power_basis' and 
+            sim_blms=None. Defaults to 0.5*root(pi).
+        blm_phase_max (float, optional): Maximum boundary for blm phases to draw a random value from when method='sqrt_power_basis' and 
+            sim_blms=None. Defaults to 1.5*root(pi).
+        add_rand_noise (bool, optional): Whether to add random gaussian noise in the pixel method.
+        return_vals (bool, optional): Whether to return a tuple of injected parameters/power, rho and sig. 
+            Defaults to None.
+
+    Returns:
+        tuple (optional): A tuple of 3 np.ndarrays containing the 
+            injected cross-correlations, injected cross-correlation uncertainties and 
+            injected pair covariance matrix (None if pair_cov=False).
+            NOTE: The function also creates 'injected' instances of the anis_pta.
+
+    Raises:
+        ValueError: If method not in ['pixel', 'power_basis', 'sqrt_power_basis'].
+        ValueError: If anis_pta.include_noise_marginalization and NM==1
+
+    """
+
+    rng = nr.default_rng(seed=seed)
+    
+    if method == 'pixel':
+
+        if h is not None:
+            input_map = h if type(h) is np.ndarray else np.array(h)
+            
+        else:
+            # From MAPS example
+            # Simulate an isotropic background plus a hotspot
+            input_map = np.ones(anis_pta.npix)
+            vec = hp.ang2vec(sim_theta, sim_phi, lonlat=lonlat)
+            radius = np.radians(sim_pixel_radius)
+
+            disk_anis = hp.query_disc(nside = anis_pta.nside, vec = vec, radius = radius, inclusive = False)
+    
+            input_map[disk_anis] += sim_power
+
+        if norm_pixel:
+            pixel_area = (4*np.pi) / anis_pta.npix
+            input_map = (input_map / trapz(input_map, dx=pixel_area)) * (4*np.pi)
+
+        # Simulate rho
+        if include_A2_pixel:
+            sim_orf = (10**sim_log10_A2) * (anis_pta.F_mat @ input_map)
+        else:
+            sim_orf = anis_pta.F_mat @ input_map
+
+        input_clms = ac.clmFromMap_fast(h=input_map, lmax=anis_pta.l_max)
+            
+
+    elif method == 'power_basis':
+
+        # If sim_clm not specified
+        if sim_clms is None:
+            sim_clms = [np.sqrt(4*np.pi), *rng.uniform(low=clm_min, high=clm_max, size=anis_pta.clm_size-1)]
+            #raise ValueError("Specify clm values in sim_clms to do a power_basis injection!")
+        
+        input_clms = sim_clms if type(sim_clms) is np.ndarray else np.array(sim_clms)
+        sim_orf = (10**sim_log10_A2) * (anis_pta.Gamma_lm.T @ input_clms)
+
+        input_map = (10**sim_log10_A2) * ac.mapFromClm(input_clms, nside=anis_pta.nside)
+        anis_pta.injected_clms = input_clms
+
+
+    elif method == 'sqrt_power_basis':
+
+        # If sim_clm not specified
+        if sim_blms is None:
+            sim_blms = [1.0]
+            for l in range(1, anis_pta.blmax+1):
+                for m in range(l+1):
+                    ### for m=0; b_l0 can be negative
+                    if m==0:
+                        sim_blms.append(rng.uniform(low=bl0_min, high=bl0_max))
+                    else:
+                    ### for m!=0; amplitude > 0 and 0<phase<2pi
+                        sim_blms.append(rng.uniform(low=blm_amp_min, high=blm_amp_max))
+                        sim_blms.append(rng.uniform(low=blm_phase_min, high=blm_phase_max))
+                        
+            #raise ValueError("Specify blm values in sim_clms to do a sqrt_power_basis injection!")        
+        
+        input_blms = sim_blms if type(sim_blms) is np.ndarray else np.array(sim_blms)
+        ### Convert blm amp & phase to complex blms (still no '-m'; size:l>=1,m>=0->l + 00) b_00 is set internally here
+        ### Convert complex blms to alms / complex clms (now with '-m'; size:(lmax+1)**2)
+        ### Convert complex clms / alms to real clms and normalize to c_00=root(4pi)
+        input_clms = convert_blm_params_to_clm(anis_pta, input_blms) # need to pass b_00 here
+        sim_orf = (10**sim_log10_A2) * (anis_pta.Gamma_lm.T @ input_clms)#[:, np.newaxis]) # (ncc x nclm) @ (nclm x 1) => RP - (ncc x 1)
+
+        input_map = (10**sim_log10_A2) * ac.mapFromClm(input_clms, nside=anis_pta.nside)
+        anis_pta.injected_blms = input_blms
+
+
+    else:
+        raise ValueError("Method can only accept 'pixel', 'power_basis' or 'sqrt_power_basis'!")
+
+
+    # Simulate sig
+    inj_sig = np.repeat(sim_sig, repeats=anis_pta.npairs)
+        
+    # Add random noise if specified
+    if add_rand_noise:
+        # Simulate rho - Shift by mean and scale by std
+        normal_dist = rng.normal(size=anis_pta.npairs)
+        inj_rho = sim_orf.reshape(anis_pta.npairs) + sim_sig*normal_dist
+    else:
+        inj_rho = sim_orf
+
+    if pair_cov:
+        inj_pair_cov = np.diag(np.repeat(sim_sig, repeats=anis_pta.npairs))
+    else:
+        inj_pair_cov = None
+
+    
+    n_draws = int(n_draws)
+    if anis_pta.n_draws > 1:
+        if n_draws == 1:
+            raise ValueError("NM must be greater than 1 when include_noise_marginalization or joint noise" + 
+                             " likelihood maximization flag in the pta is active!!")
+        inj_rho_nm = np.array([rng.normal(loc=rho_per_draw, scale=sim_sig, size=n_draws) 
+                               for rho_per_draw in inj_rho]).T
+        inj_sig_nm = np.repeat(inj_sig[:, np.newaxis], n_draws, axis=1).T
+
+        anis_pta.injected_rho = inj_rho_nm
+        anis_pta.injected_sig = inj_sig_nm
+        anis_pta.injected_rho_mean = inj_rho
+        anis_pta.injected_sig_mean = inj_sig
+    
+    else:
+        anis_pta.injected_rho = inj_rho
+        anis_pta.injected_sig = inj_sig
+    
+    anis_pta.injected_pair_cov = inj_pair_cov
+
+    anis_pta.injected_power = input_map
+    anis_pta.injected_Cl = angular_power_spectrum(clm=input_clms)
+    
+    
+    if return_vals:
+        return inj_rho, inj_sig, inj_pair_cov
+    
+

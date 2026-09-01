@@ -1,10 +1,14 @@
 import numpy as np, sympy as sp, scipy.special as scsp
 import scipy.optimize as sopt
 
+import os
 import pickle, healpy as hp
+import pandas as pd
+import warnings
 
 import numpy.random as nr, scipy.stats as scst
 from PTMCMCSampler.PTMCMCSampler import PTSampler as ptmcmc
+from enterprise.signals import parameter
 
 from enterprise.signals import anis_coefficients as ac
 
@@ -24,6 +28,10 @@ from astroML.linear_model import LinearRegression
 
 import lmfit
 from lmfit import minimize, Parameters
+
+# Bilby packages to import
+import bilby
+from bilby.core.prior import Uniform
 
 class anis_pta():
     """A class to perform anisotropic GW searches using PTA data.
@@ -60,16 +68,16 @@ class anis_pta():
         use_physical_prior (bool): Whether to use physical priors or not.
         include_pta_monopole (bool): Whether to include the monopole term in the search.
         mode (str): The mode of the spherical harmonic decomposition to use.
-            Must be 'power_basis', 'sqrt_power_basis', or 'hybrid'.
+            Must be 'power_basis', 'sqrt_power_basis', or 'pixel'.
         sqrt_basis_helper (CG.clebschGordan): A helper object for the sqrt power basis.
         ndim (int): The number of dimensions for the search.
         F_mat (np.ndarray): The antenna response matrix [npair x npix].
         Gamma_lm (np.ndarray): The spherical harmonic basis [npair x ndim].
     """
 
-    def __init__(self, psrs_theta, psrs_phi, xi = None, rho = None, sig = None, 
+    def __init__(self, psrs_theta, psrs_phi, n_draws=1, xi = None, rho = None, sig = None, 
                  os = None, pair_cov = None, l_max = 6, nside = 2, mode = 'power_basis', 
-                 use_physical_prior = False, include_pta_monopole = False, 
+                 use_physical_prior = False, include_pta_monopole = False, include_A2_pixel = False, 
                  pair_idx = None):
         """Constructor for the anis_pta class.
 
@@ -83,6 +91,8 @@ class anis_pta():
         Args:
             psrs_theta (np.ndarray): An array of pulsar position theta [npsr].
             psrs_phi (np.ndarray): An array of pulsar position phi [npsr].
+            n_draws (int, optional): The no. of Noise-Draws to perform noise-marginalization.
+                Gives a warning if NM>1.
             xi (np.ndarray, optional): A list of pulsar pair separations from the OS [npair].
             rho (np.ndarray, optional): A list of pulsar pair correlations [npair].
             sig (np.ndarray, optional): A list of 1-sigma uncertainties on rho [npair].
@@ -91,14 +101,14 @@ class anis_pta():
             l_max (int): The maximum l value for spherical harmonics.
             nside (int): The nside of the healpix sky pixelization.
             mode (str): The mode of the spherical harmonic decomposition to use.
-                Must be 'power_basis', 'sqrt_power_basis', or 'hybrid'.
+                Must be 'power_basis', 'sqrt_power_basis', or 'pixel'.
             use_physical_prior (bool): Whether to use physical priors or not.
-            include_pta_monopole (bool): Whether to include the monopole term in the search.
+            include_pta_monopole (bool, optional): Whether to include the monopole term in the search.
             pair_idx (np.ndarray, optional): An array of pulsar indices for each pair [npair x 2].
 
         Raises:
             ValueError: If the lengths of psrs_theta and psrs_phi are not equal.
-            ValueError: If the length of pair_idx is not equal to the number of pulsar pairs.            
+            ValueError: If the length of pair_idx is not equal to the number of pulsar pairs.
         """
         # Pulsar positions
         self.psrs_theta = psrs_theta if type(psrs_theta) is np.ndarray else np.array(psrs_theta)
@@ -125,6 +135,11 @@ class anis_pta():
         self.rho, self.sig, self.os, self.pair_cov = None, None, None, None
         self.pair_ind_N_inv, self.pair_cov_N_inv = None, None
 
+        self.n_draws = int(n_draws)
+        if n_draws > 1:
+            warnings.warn("Noise-Marginalization only works with Bayesian Inference!!")
+        
+        #NM = 1 if (rho is None or np.array(rho).ndim == 1) else np.array(rho).shape[0]
         self.set_data(rho, sig, os, pair_cov)
         
         # Check if pair_idx is valid
@@ -147,21 +162,30 @@ class anis_pta():
        
         self.use_physical_prior = bool(use_physical_prior)
         self.include_pta_monopole = bool(include_pta_monopole)
+        self.include_A2_pixel = bool(include_A2_pixel)
 
-        if mode in ['power_basis', 'sqrt_power_basis', 'hybrid']:
+        if mode in ['power_basis', 'sqrt_power_basis', 'pixel']:
             self.mode = mode
         else:
-            raise ValueError("mode must be either 'power_basis','sqrt_power_basis' or 'hybrid'")
+            raise ValueError("mode must be either 'power_basis','sqrt_power_basis' or 'pixel'")
 
+        
+        # set param_names for bayesian inference
+        self.param_names = self._set_bayesian_param_names()
         
         self.sqrt_basis_helper = CG.clebschGordan(l_max = self.l_max)
         #self.reorder, self.neg_idx, self.zero_idx, self.pos_idx = self.reorder_hp_ylm()
 
-        if self.mode == 'power_basis':
-            self.ndim = 1 + (self.l_max + 1) ** 2
+        if self.mode == 'pixel':
+            if self.include_A2_pixel:
+                self.ndim = 1 + self.npix
+            else:
+                self.ndim = self.npix
+        elif self.mode == 'power_basis':
+            self.ndim = 1 + (self.l_max + 1) ** 2 - 1 # c_00 is fixed
         elif self.mode == 'sqrt_power_basis':
             #self.ndim = 1 + (2 * (hp.Alm.getsize(int(self.blmax)) - self.blmax))
-            self.ndim = 1 + (self.blmax + 1) ** 2
+            self.ndim = 1 + (self.blmax + 1) ** 2 - 1 # b_00 is fixed
 
         self.F_mat = self.antenna_response()
 
@@ -194,21 +218,50 @@ class anis_pta():
 
         Args:
             rho (list, optional): A list of pulsar pair correlated amplitudes (<rho> = <A^2*ORF>).
+                For NM it must be of shape [ndraws x npairs].
             sig (list, optional): A list of 1-sigma uncertaintties on rho.
+                For NM it must be of shape [ndraws x npairs].
             os (float, optional): The OS' fit A^2 value.
+                For NM it must be of shape [ndraws].
             covariance (np.ndarray, optional): The pair covariance matrix [npair x npair].
+                For NM it must be of shape [ndraws x npairs x npairs].
+
+        Raises:
+            ValueError: If the no. of noise draws doesn't match with the input of 
+                rho, sig, os and covariance.
         """
         # Read in OS and normalize cross-correlations by OS. 
         # (i.e. get <rho/OS> = <ORF>)
         self._Lt_pc, self._Lt_nopc = None, None # Reset the cholesky decompositions
 
-        if (rho is not None) and (sig is not None) and (os is not None):
-            self.os = os
-            self.rho = np.array(rho) / self.os
-            self.sig = np.array(sig) / self.os
 
-            # Set the inverse of the pair independent covariance matrix
-            self.pair_ind_N_inv = self._get_N_inv(pair_cov = False)
+        if (rho is not None) and (sig is not None) and (os is not None):
+
+            rho, sig, os = np.array(rho), np.array(sig), np.array(os)
+            
+            # Normal case without noise-marginalization
+            if self.n_draws == 1:
+                self.os = os
+                self.rho = rho / self.os
+                self.sig = sig / self.os
+                # Set the inverse of the pair independent covariance matrix
+                self.pair_ind_N_inv = self._get_N_inv(pair_cov = False)
+
+            # Raise Error if NM and rho, sig or os aren't 2-d, 2-d, 1-d arrays.
+            elif self.n_draws > 1 and (rho.ndim !=2 or sig.ndim !=2 or os.ndim !=1):
+                raise ValueError("Dimensionality mismatch! Make sure the rho, sig are 2-d arrays of shape [ndraws x npairs] " + 
+                                 "and os is of shape [ndraws] when NM > 1!!")
+
+            # Raise Error if NM and rho, sig or os are not 2-d, 2-d, 1-d arrays.
+            elif self.n_draws > 1 and (rho.shape != sig.shape or os.shape[0] != rho.shape[0] or os.shape[0] != sig.shape[0]):
+                raise ValueError("The shapes of rho and sig doesn't match. Or the length of os doesn't match with no. of rows of rho and sig!! "+ 
+                                 "rho, sig must be 2-d arrays of shape [ndraws x npairs] and os of shape [ndraws] when NM > 1!!")
+
+            # Noise-marginalization case: scaling by os, the corresponding noise draw.
+            else:
+                self.os = os
+                self.rho = rho / self.os[:, np.newaxis] 
+                self.sig = sig / self.os[:, np.newaxis]
 
         else:
             self.rho = None
@@ -216,10 +269,32 @@ class anis_pta():
             self.os = None
 
         if covariance is not None:
-            self.pair_cov = covariance / self.os**2
+            
+            covariance = np.array(covariance)
+            
+            # Normal case without noise-marginalization
+            if self.n_draws == 1:
+                self.pair_cov = covariance / self.os**2
+                # A handy attribute to be used in likelihood evaluation
+                cov_det_sign, cov_det_val = np.linalg.slogdet(2 * np.pi * self.pair_cov)
+                self._lik_denom = cov_det_sign*cov_det_val
+                # Get the inverse of the pair covariance matrix
+                self.pair_cov_N_inv = self._get_N_inv(pair_cov = True)
 
-            # Get the inverse of the pair covariance matrix
-            self.pair_cov_N_inv = self._get_N_inv(pair_cov = True)
+            # Raise Error if NM and covariance is not 3-d.
+            elif self.n_draws > 1 and covariance.ndim != 3:
+                raise ValueError("Dimensionality mismatch! Make sure covariance is a 3-d arrays of shape [ndraws x npairs x npairs] ")
+
+            # Raise Error if NM and rho, sig or os are not 2-d, 2-d, 1-d arrays.
+            elif self.n_draws > 1 and covaraince.shape[0] != rho.shape[0]:
+                raise ValueError("The no. of noise draws in rho, sig and os doesn't match with covariance!!")
+
+            # Noise-marginalization case: scaling by os, the corresponding noise draw.
+            else:
+                self.pair_cov = covariance / (self.os[:, np.newaxis, np.newaxis] ** 2)
+                # A handy attribute to be used in likelihood evaluation
+                cov_det_sign, cov_det_val = zip(*[np.linalg.slogdet(2 * np.pi * self.pair_cov[n]) for n in range(self.n_draws)])
+                self._lik_denom = np.array(cov_det_sign)*np.array(cov_det_val)
 
         else:
             self.pair_cov = None
@@ -839,75 +914,102 @@ class anis_pta():
         return opt_params
 
 
-    def prior(self, params):
-        """A method to calculate the prior for power and sqrt power bases for the given parameters.
+    def _set_bayesian_param_names(self):
 
-        This method returns the prior given a parameter values for the clm (for
-        the power bases) or the blm (for the sqrt power bases). This method also
-        takes into acount whether you enable the physical prior or not.
+        
+        if self.mode == 'pixel':
 
-        Args:
-            params (np.ndarray or list): An array of parameters to calculate the prior for.
-
-        Returns:
-            float: The (non-log) prior value for the given parameters.
-        """
-
-        if self.mode == 'power_basis':
-            amp2 = params[0]
-            clm = params[1:]
-            maxl = int(np.sqrt(len(clm)))
-
-            if clm[0] != np.sqrt(4 * np.pi) or any(np.abs(clm[1:]) > 15) or (amp2 < np.log10(1e-5) or amp2 > np.log10(1e3)):
-                return -np.inf #0 #np.longdouble(1e-300)
-            elif self.use_physical_prior:
-                #NOTE: if using physical prior, make sure to set initial sample to isotropy
-
-                sh_map = ac.mapFromClm(clm, nside = self.nside)
-
-                if np.any(sh_map < 0):
-                    return -np.inf #0
-                else:
-                    return np.longdouble((1 / 10) ** (len(params) - 1))
-
+            if self.include_A2_pixel:
+                npix_params = [f"log10_Apix_{i}" for i in range(self.npix)]
+                param_names = ["log10_A2", *npix_params]
             else:
-                return np.longdouble((1 / 10) ** (len(params) - 1))
+                param_names = [f"log10_Apix_{i}" for i in range(self.npix)]
+        
+        elif self.mode == 'power_basis':
+            
+            clm_params = [f"c_{l}{m}" for l in range(1, self.l_max+1) for m in range(-l, l+1)]
+            param_names = ["log10_A2", *clm_params]
 
         elif self.mode == 'sqrt_power_basis':
-            amp2 = params[0]
-            blm_params = params[1:]
 
-            if (amp2 < np.log10(1e-5) or amp2 > np.log10(1e3)):
-                return -np.inf #0
+            blm_params = []
+            ### b_00 = 1 is set internally
+            for l in range(1, self.blmax+1):
+                for m in range(l+1):
+                    if m == 0:
+                        blm_params.append(f"b_{l}{m}")
+                    else:
+                        blm_params.append(f"b_{l}{m}_amp")
+                        blm_params.append(f"b_{l}{m}_phase")
+                        
+            param_names = ["log10_A2", *blm_params]
 
+
+        return param_names
+
+            
+
+    def LogPrior(self, params):
+
+        """A method to return the log-priors for the given set of parameters.
+
+        This function works with 'power_basis' for now.
+
+        Args:
+            params (list or np.ndarray): An indexable object containing the parameters.
+
+        Returns:
+            float: The log-prior for the given parameters.
+        """
+
+        if self.mode == 'pixel':
+
+            if self.include_A2_pixel:
+                log10_A2 = params[0]
+                log10_Apix = params[1:] if type(params[1:]) is np.ndarray else np.array(params[1:])
+
+                log10_A2_pdf = self.priors[0].get_logpdf(log10_A2)
+                log10_Apix_pdf = np.sum([p.get_logpdf(c) for p,c in zip(self.priors[1:], log10_Apix)])
+                
+                return log10_A2_pdf + log10_Apix_pdf
+                
             else:
-                idx = 1
-                for ll in range(self.blmax + 1):
-                    for mm in range(0, ll + 1):
+                log10_Apix = params if type(params) is np.ndarray else np.array(params)
+                
+                log10_Apix_pdf = np.sum([p.get_logpdf(c) for p,c in zip(self.priors, log10_Apix)])
+                
+                return log10_Apix_pdf
+        
+        
+        elif self.mode == 'power_basis':
+            
+            log10_A2 = params[0]
+            clm = params[1:] if type(params[1:]) is np.ndarray else np.array(params[1:])
+        
+            log10_A2_pdf = self.priors[0].get_logpdf(log10_A2)
+            clm_pdf = np.sum([p.get_logpdf(c) for p,c in zip(self.priors[1:], clm)])
 
-                        if ll == 0 and params[idx] != 1:
-                            return -np.inf #0
+            return log10_A2_pdf + clm_pdf 
 
-                        if mm == 0 and (params[idx] > 5 or params[idx] < -5):
-                            return -np.inf #0
+        
+        elif self.mode == 'sqrt_power_basis':
 
-                        if mm != 0 and (params[idx] > 5 or params[idx] < 0 or params[idx + 1] >= 2 * np.pi or params[idx + 1] < 0):
-                            return -np.inf #0
+            log10_A2 = params[0]
+            blm = params[1:] if type(params[1:]) is np.ndarray else np.array(params[1:])
 
-                        if ll == 0:
-                            idx += 1
-                        elif mm == 0:
-                            idx += 1
-                        else:
-                            idx += 2
+            log10_A2_pdf = self.priors[0].get_logpdf(log10_A2)
+            blm_pdf = np.sum([p.get_logpdf(b) for p,b in zip(self.priors[1:], blm)])
 
-                return np.longdouble((1 / 10) ** (len(params) - 1))
+            return log10_A2_pdf + blm_pdf 
 
 
-    def logLikelihood(self, params):
+
+
+    def LogLikelihood(self, params):
+
         """A method to return the log-likelihood for the given set of parameters.
 
-        This function works with all modes, 'power_basis', 'sqrt_power_basis', and 'hybrid'.
+        This function works with 'power_basis' for now.
 
         Args:
             params (list or np.ndarray): An indexable object containing the parameters.
@@ -916,117 +1018,259 @@ class anis_pta():
             float: The log-likelihood for the given parameters.
         """
 
-        if self.mode == 'hybrid':
+        if self.mode == 'pixel':
 
-            amp2 = params[0]
-            clm = params[1:]
-
-            #Fix c_00 to sqrt(4 * pi)
-            clm[0] = np.sqrt(4 * np.pi)
-
-            sim_orf = self.orf_from_clm(params)
-
-            #Decompose the likelihood which is a product of gaussians into sums when getting log-likely
-            alpha = (self.rho - sim_orf) ** 2 / (2 * self.sig ** 2)
-            beta = np.longdouble(1 / (self.sig * np.sqrt(2 * np.pi)))
-
-            loglike = np.sum(np.log(beta)) - np.sum(alpha)
+            if self.include_A2_pixel:
+                A2 = 10 ** params[0]
+                Apix = 10 ** params[1:]
+            else:
+                A2 = 1.0
+                Apix = 10 ** params
+            
+            map_from_Apix = Apix * np.ones(self.npix)
+            
+            sim_orf = A2 * (self.F_mat @ map_from_Apix)
+            
 
         elif self.mode == 'power_basis':
+            
+            A2 = 10 ** params[0]
+            clm_wo_00 = params[1:] if type(params[1:]) is np.ndarray else np.array(params[1:])
 
-            amp2 = 10 ** params[0]
-            clm = params[1:]
-
-            #clm[0] = np.sqrt(4 * np.pi)
-
-            sim_orf = amp2 * np.sum(clm[:, np.newaxis] * self.Gamma_lm, axis = 0)
-
-            alpha = (self.rho - sim_orf) ** 2 / (2 * self.sig ** 2)
-            beta = np.longdouble(1 / (self.sig * np.sqrt(2 * np.pi)))
-
-            loglike = np.sum(np.log(beta)) - np.sum(alpha)
+            ### Fixing c_00 = root(4pi)
+            clm_00 = np.sqrt(4*np.pi)
+            clm = np.concatenate(([clm_00], clm_wo_00))
+            
+            sim_orf = A2 * (self.Gamma_lm.T @ clm) #[:, np.newaxis]) # (ncc x nclm) @ (nclm x 1) => RP - (ncc x 1)
+            
 
         elif self.mode == 'sqrt_power_basis':
 
-            amp2 = 10 ** params[0]
-            blm_params = params[1:]
+            A2 = 10 ** params[0]
+            blm = params[1:]
 
-            #blm_params[0] = 1
+            ### Convert blm amp & phase to complex blms (still no '-m'; size:l>=1,m>=0->l + 00) b_00 is set internally here
+            ### Convert complex blms to alms / complex clms (now with '-m'; size:(lmax+1)**2)
+            ### Convert complex clms / alms to real clms and normalize to c_00=root(4pi)
+            b_00 = 1.0
+            clm = utils.convert_blm_params_to_clm(self, [b_00, *blm]) # need to pass b_00 here
+            
+            sim_orf = A2 * (self.Gamma_lm.T @ clm) #[:, np.newaxis]) # (ncc x nclm) @ (nclm x 1) => RP - (ncc x 1)
+            
+    
+        #loglike = 1.0
+        # Works even in noise-marginalization as numpy broadcasting is achieved.
+        residual = self.rho - sim_orf # self.rho[:, np.newaxis] -> rho (ncc x 1) - RP (ncc x 1) => (ncc x 1)
+        
+        if self.pair_cov is not None:
+            lik_num = (residual.T @ self.pair_cov_N_inv @ residual) # (1 x ncc) @ (ncc x ncc) @ (ncc x 1) => ()
+            loglike = -0.5 * np.sum(lik_num + self._lik_denom)
 
-            #b00 is set internally, no need to pass it in
-            blm = self.sqrt_basis_helper.blm_params_2_blms(blm_params[1:])
+        else:
+            lik_num = (residual**2) / (self.sig**2) # .ravel() in residual
+            lik_denom = 2 * np.pi * (self.sig**2)
 
-            new_clms = self.sqrt_basis_helper.blm_2_alm(blm)
+            if self.perform_noise_marginalization:
+                loglike_per_draw = -0.5 * np.sum(lik_num + np.log(lik_denom), axis=1)
+                loglike = np.sum(loglike_per_draw) - self.n_draws
+            else:
+                loglike = -0.5 * np.sum(lik_num + np.log(lik_denom))
 
-            #Only need m >= 0 entries for clmfromalm
-            clms_rvylm = self.clmFromAlm(new_clms)
-            #clms_rvylm[0] *= 6.283185346689728
-
-            sim_orf = amp2 * np.sum(clms_rvylm[:, np.newaxis] * self.Gamma_lm, axis = 0)
-
-            alpha = (self.rho - sim_orf) ** 2 / (2 * self.sig ** 2)
-            beta = np.longdouble(1 / (self.sig * np.sqrt(2 * np.pi)))
-
-            loglike = np.sum(np.log(beta)) - np.sum(alpha)
 
         return loglike
-        #return np.prod(gauss, dtype = np.longdouble)
 
 
-    def logPrior(self, params):
-        """A method to calculate the log of the prior for the given parameters.
+    def set_ptmcmc(self, prior_form="Uniform", log10_A2_prior_min=-2, log10_A2_prior_max=2, 
+                   log10_Apix_prior_min=-2, log10_Apix_prior_max=2, 
+                   clm_prior_min=-5, clm_prior_max=5, 
+                   bl0_prior_min=-5, bl0_prior_max=5, blm_amp_prior_min=0, blm_amp_prior_max=5, blm_phase_prior_min=0, blm_phase_prior_max=2*np.pi,
+                   norm_log10_Apix_mu=0, norm_log10_Apix_sigma=1, 
+                   norm_clm_mu=0, norm_clm_sigma=1,
+                   norm_bl0_mu=0, norm_bl0_sigma=1,
+                   norm_blm_amp_mu=0, norm_blm_amp_sigma=1, 
+                   perform_noise_marginalization=False, 
+                   outdir='./ptmcmc', resume=False, save_anis_pta=False):
 
-        NOTE: This function simply returns the np.log() for the prior() function.
+        """A method to return the PTMCMC sampler for MAPS to perform bayesian inference.
+
+        This function works with all basis in MAPS.
 
         Args:
-            params (np.ndarray or list): An array of parameters to calculate the prior for.
+            prior_form (str, optional): The prior distribution you wish to use. Note that this should match the available attributes 
+                of the enterprise.parameter class. Defaults to "Uniform". Only Uniform, Normal and TruncNormal is supported.
+            log10_A2_prior_min (float, optional): Lower bound for log10_A2 uniform priors. Is always a unifrom prior. Defaults to -2.
+            log10_A2_prior_max (float, optional): Upper bound for log10_A2 uniform priors. Is always a unifrom prior. Defaults to 2.
+            log10_Apix_prior_min (float, optional): Lower bound for pixel uniform priors. Used as pmin in TruncNormal. Defaults to -2.
+            log10_Apix_prior_max (float, optional): Upper bound for pixel uniform priors. Used as pmax in TruncNormal. Defaults to 2.
+            clm_prior_min (float, optional): Lower bound for clm's uniform priors. Used as pmin in TruncNormal. Defaults to -5.
+            clm_prior_max (float, optional): Upper bound for clm's uniform priors. Used as pmax in TruncNormal. Defaults to 5.
+            bl0_prior_min (float, optional): Lower bound for bl0 uniform priors. Used as pmin in TruncNormal. Defaults to -5.
+            bl0_prior_max (float, optional): Upper bound for bl0 uniform priors. Used as pmax in TruncNormal. Defaults to 5.
+            blm_amp_prior_min (float, optional): Lower bound for blm (m>=1) amplitude uniform priors. Used as pmin in TruncNormal. Defaults to 0.
+            blm_amp_prior_max (float, optional): Upper bound for blm (m>=1) amplitude uniform priors. Used as pmax in TruncNormal. Defaults to 5.
+            blm_phase_prior_min (float, optional): Lower bound for blm (m>=1) phase uniform priors. Is always a unifrom prior. Defaults to 0.
+            blm_phase_prior_max (float, optional): Upper bound for blm (m>=1) phase uniform priors. Is always a unifrom prior. Defaults to 2*pi.
+            norm_log10_Apix_mu (float, optional): mu for Normal/TruncNormal. Defaults to 0.
+            norm_log10_Apix_sigma (float, optional): sigma for Normal/TruncNormal. Defaults to 1.
+            norm_clm_mu (float, optional): mu for Normal/TruncNormal. Defaults to 0.
+            norm_clm_sigma (float, optional): sigma for Normal/TruncNormal. Defaults to 1.
+            norm_bl0_mu (float, optional): mu for Normal/TruncNormal. Defaults to 0.
+            norm_bl0_sigma (float, optional): sigma for Normal/TruncNormal. Defaults to 1.
+            norm_blm_amp_mu (float, optional): mu for Normal/TruncNormal. Defaults to 0.
+            norm_blm_amp_sigma (float, optional): sigma for Normal/TruncNormal. Defaults to 1.
+            perform_noise_marginalization (bool, optional): Whether to perform NM.
+                Defaults to False.
+            outdir (str, optional): The path to save the chains. Defaults to './ptmcmc'
+            resume (bool, optional): Whether to resume a previous run. Defaults to False
+            save_anis_pta (bool, optional): Whether to save the anisotropy object for post prcessing help. Defaults to False.
 
         Returns:
-            float: The log_10 of the prior value for the given parameters.
+            object: The PTMCMC sampler object.
+
+        Raises:
+            ValueError: If prior_form is not 'Uniform', 'Normal' or 'TruncNormal'.
+            ValueError: If mode is not 'power_basis', 'sqrt_power_basis' or 'pixel'.
         """
-        return np.log(self.prior(params))
+        
+        ### Set prior class and keyword arguments.
+        if prior_form == 'Uniform':
+            ### Setting up a prior class according to prior_form
+            prior_class = getattr(parameter, prior_form)
+            
+            ### Setting up the keyword arguments of the respective prior class.
+            log10_Apix_kwargs = dict(pmin=log10_Apix_prior_min, pmax=log10_Apix_prior_max)
+            clm_kwargs = dict(pmin=clm_prior_min, pmax=clm_prior_max)
+            bl0_kwargs = dict(pmin=bl0_prior_min, pmax=bl0_prior_max)
+            
+            prior_class_blm_amp = prior_class
+            blm_amp_kwargs = dict(pmin=blm_amp_prior_min, pmax=blm_amp_prior_max)
+            #blm_phase_kwargs = dict(pmin=0, pmax=2*np.pi)
 
+        elif prior_form == 'Normal':
+            ### Setting up a prior class according to prior_form
+            prior_class = getattr(parameter, prior_form)
+            
+            ### Setting up the keyword arguments of the respective prior class.
+            log10_Apix_kwargs = dict(mu=norm_log10_Apix_mu, sigma=norm_log10_Apix_sigma)
+            clm_kwargs = dict(mu=norm_clm_mu, sigma=norm_clm_sigma)
+            bl0_kwargs = dict(mu=norm_bl0_mu, sigma=norm_bl0_sigma)
+            
+            ### Note we must have half-gaussian for blm_amp's
+            prior_class_blm_amp = getattr(parameter, 'TruncNormal')
+            blm_amp_kwargs = dict(mu=norm_blm_amp_mu, sigma=norm_blm_amp_sigma, 
+                                  pmin=blm_amp_prior_min, pmax=blm_amp_prior_max)
+        
+        elif prior_form == 'TruncNormal':
+            ### Setting up a prior class according to prior_form
+            prior_class = getattr(parameter, prior_form)
+            
+            ### Setting up the keyword arguments of the respective prior class.
+            log10_Apix_kwargs = dict(mu=norm_log10_Apix_mu, sigma=norm_log10_Apix_sigma, 
+                                     pmin=log10_Apix_prior_min, pmax=log10_Apix_prior_max)
+            clm_kwargs = dict(mu=norm_clm_mu, sigma=norm_clm_sigma, 
+                              pmin=clm_prior_min, pmax=clm_prior_max)
+            bl0_kwargs = dict(mu=norm_bl0_mu, sigma=norm_bl0_sigma, 
+                              pmin=bl0_prior_min, pmax=bl0_prior_max)
+            
+            prior_class_blm_amp = prior_class
+            blm_amp_kwargs = dict(mu=norm_blm_amp_mu, sigma=norm_blm_amp_sigma, 
+                                  pmin=blm_amp_prior_min, pmax=blm_amp_prior_max)
+            #blm_phase_kwargs = dict(pmin=0, pmax=2*np.pi)
 
-    def get_random_sample(self):
-        """A method to get a random sample from the prior distribution.
+        else:
+            raise ValueError("Only 'Uniform', 'Normal' and 'TruncNormal' is currently an acceptable prior_form!")
+    
+        
+        ### Constructing the priors
+        if self.mode == 'pixel':
 
-        This method works with all modes, 'power_basis', 'sqrt_power_basis', and 'hybrid'.
-
-        Returns:
-            np.ndarray: A random sample for all parameters from the prior distribution.
-        """
-
-        if self.mode == 'power_basis':
-
-            if self.use_physical_prior:
-                x0 = np.append(np.append(np.log10(nr.uniform(0, 30, 1)), np.array([np.sqrt(4 * np.pi)])), np.repeat(0, self.ndim - 2))
+            log10_Apix_prior = [prior_class(**log10_Apix_kwargs)(f"log10_Apix_{i}") for i in range(self.npix)]
+            if self.include_A2_pixel:
+                log10_A2_prior = parameter.Uniform(log10_A2_prior_min, log10_A2_prior_max)("log10_A2")
+                self.priors = [log10_A2_prior, *log10_Apix_prior]
             else:
-                x0 = np.append(np.append(np.log10(nr.uniform(0, 30, 1)), np.array([np.sqrt(4 * np.pi)])), nr.uniform(-5, 5, self.ndim - 2))
+                self.priors = log10_Apix_prior
+
+        elif self.mode == 'power_basis':
+            
+            log10_A2_prior = parameter.Uniform(log10_A2_prior_min, log10_A2_prior_max)("log10_A2")
+            clm_prior = [prior_class(**clm_kwargs)(f"c_{l}{m}") for l in range(1, self.l_max+1) for m in range(-l, l+1)]
+            self.priors = [log10_A2_prior, *clm_prior]
 
         elif self.mode == 'sqrt_power_basis':
 
-            x0 = np.full(self.ndim, 0.0)
+            log10_A2_prior = parameter.Uniform(log10_A2_prior_min, log10_A2_prior_max)("log10_A2")
+            blm_prior = []
+            ### b_00 = 1 is set internally so no need to set anything for it!
+            for l in range(1, self.blmax+1):
+                for m in range(l+1):
+                    if m == 0:
+                        blm_prior.append(prior_class(**bl0_kwargs)(f"b_{l}{m}"))
+                    else:
+                        blm_prior.append(prior_class_blm_amp(**blm_amp_kwargs)(f"b_{l}{m}_amp"))
+                        blm_prior.append(parameter.Uniform(blm_phase_prior_min, blm_phase_prior_max)(f"b_{l}{m}_phase"))
+                        
+            self.priors = [log10_A2_prior, *blm_prior]
+            
 
-            x0[0] = nr.uniform(np.log10(1e-5), np.log10(30))
+        else:
+            raise ValueError("Select the mode compatible with MAPS!")
 
-            idx = 1
-            for ll in range(self.blmax + 1):
-                for mm in range(0, ll + 1):
 
-                    if ll == 0:
-                        x0[idx] = 1.
-                        idx += 1
+        #NM?
+        self.perform_noise_marginalization = bool(perform_noise_marginalization)
+        
+        # dimension of parameter space
+        self.ndim = len(self.param_names)
 
-                    elif mm == 0:
-                        x0[idx] = 0 #nr.uniform(0, 5)
-                        idx += 1
+        # initial jump covariance matrix
+        if os.path.exists(outdir + "/cov.npy") and resume:
+            cov = np.load(outdir + "/cov.npy")
 
-                    elif mm != 0:
-                        x0[idx] = 0 #nr.uniform(0, 5)
-                        x0[idx + 1] = 0 #nr.uniform(0, 2 * np.pi)
-                        idx += 2
+            # check that the one we load is the same shape as our data
+            cov_new = np.diag(np.ones(self.ndim) * 0.1**2)
+            if cov.shape != cov_new.shape:
+                msg = "The covariance matrix (cov.npy) in the output folder is "
+                msg += "the wrong shape for the parameters given. "
+                msg += "Start with a different output directory or "
+                msg += "change resume to False to overwrite the run that exists."
 
-        return x0
+                raise ValueError(msg)
+        else:
+            cov = np.diag(np.ones(self.ndim) * 0.1**2)
+
+        # intialize sampler
+        sampler = ptmcmc(self.ndim, self.LogLikelihood, self.LogPrior, cov, outDir=outdir, resume=resume)
+
+
+        # save paramter list
+        with open(os.path.join(outdir, "pars.txt"), "w") as f:
+            for pn in self.param_names:
+                f.write(pn + "\n")
+
+        # save list of priors
+        with open(os.path.join(outdir, "priors.txt"), "w") as f:
+            for pr in self.priors:
+                f.write(pr.__repr__() + "\n")
+
+        # save the anisotropy object
+        if save_anis_pta:
+            saved_priors = self.priors
+            del self.priors # cannot pickle with parameter class of enterprise.signals
+            
+            with open(os.path.join(outdir, "anis_pta.pickle"), "wb") as file:
+                pickle.dump(self, file)
+
+            self.priors = saved_priors # reassigning the priors
+
+        # Warn for noise-marginalization
+        if self.perform_noise_marginalization:
+            warnings.warn("Performing Noise-Marginalization!!")
+        #elif self.include_joint_noise_likelihood_maximization:
+        #    warnings.warn("Performing Joint-Noise-Likelihood maximization from noise draws!!")
+            
+
+        return sampler
 
 
     def amplitude_scaling_factor(self):
@@ -1034,146 +1278,646 @@ class anis_pta():
         return 1 / (2 * 6.283185346689728)
 
 
+
+
 class anis_hypermodel():
 
 
-    def __init__(self, models, log_weights = None, mode = 'sqrt_power_basis', use_physical_prior = True):
+    def __init__(self, models, log_weights = None):
 
         self.models = models
-        self.num_models = len(self.models)
-        self.mode = mode
-        self.use_physical_prior = use_physical_prior
+        self.n_models = len(self.models)
+        self.log_weights = log_weights
+        
+        self.model_names = list(self.models.keys())
 
-        if log_weights is None:
-            self.log_weights = log_weights
-        else:
-            self.log_weights = np.longdouble(log_weights)
+        model_info = {'models': self.model_names, 
+                      'mode': [pt.mode for pt in self.models.values()], 
+                      'l_max': [pt2.l_max for pt2 in self.models.values()], 
+                      'ndim': [pt3.ndim for pt3 in self.models.values()],
+                      'log_weights': self.log_weights if self.log_weights is not None else [None]*self.n_models, 
+                      'nmodel_par_range': [list(np.array([-0.5, 0.5]) + np.array([i, i])) for i in range(self.n_models)]}
+        
+        self.models_init = pd.DataFrame(model_info)
 
-        self.nside = np.max([xx.nside for xx in self.models])
-
-        self.ndim = np.max([xx.ndim for xx in self.models]) + 1
-
-        self.l_max = np.max([xx.l_max for xx in self.models])
-
-        #Some configuration for spherical harmonic basis runs
-        #clm refers to normal spherical harmonic basis
-        #blm refers to sqrt power spherical harmonic basis
-        self.blmax = int(self.l_max / 2)
-        self.clm_size = (self.l_max + 1) ** 2
-        self.blm_size = hp.Alm.getsize(self.blmax)
+        ### Set the instance of unique prameters in the hypermodel parameter space.
+        self.param_names, ind = np.unique(np.concatenate([["nmodel"], *[pt.param_names for pt in self.models.values()]]), 
+                                          return_index=True)
+        self.param_names = self.param_names[np.argsort(ind)].tolist()
+        self.ndim = len(self.param_names)
+        ### Also here we have nmodel index at 0.
 
 
-    def _standard_prior(self, params):
+    def _set_pta_if_NM(self):
 
-        if self.mode == 'power_basis':
-            amp2 = params[0]
-            clm = params[1:]
-            maxl = int(np.sqrt(len(clm)))
+        for pt in self.models.values():
+            if self.perform_noise_marginalization:
+                pt.perform_noise_marginalization = True
+            else:
+                pt.perform_noise_marginalization = False
+        
+    
+    def _log_prior_by_mode(self, log10_A2_prior_min, log10_A2_prior_max, log10_Apix_prior_min, log10_Apix_prior_max, 
+                           clm_prior_min, clm_prior_max, bl0_prior_min, bl0_prior_max, 
+                           blm_amp_prior_min, blm_amp_prior_max, blm_phase_prior_min, blm_phase_prior_max):
 
-            if clm[0] != np.sqrt(4 * np.pi) or any(np.abs(clm[1:]) > 15) or (amp2 < np.log10(1e-5) or amp2 > np.log10(1e3)):
-                return -np.inf
-            elif self.use_physical_prior:
-                #NOTE: if using physical prior, make sure to set initial sample to isotropy
+        """A method to set priors and param_names for each anis_pta model. The priors set here
+        is used in the log_prior function of anis_hypermodel(). This function does not return
+        anything. It creates 'priors' and 'param_names' instances of eac of the anis_pta model
+        in self.models.
 
-                sh_map = ac.mapFromClm(clm, nside = self.nside)
+        This method works with all modes, 'power_basis', 'sqrt_power_basis', and 'pixel'.
 
-                if np.any(sh_map < 0):
-                    return -np.inf
+        """
+
+        for pt in self.models.values():
+            
+            if pt.mode == 'pixel':
+                log10_Apix_prior = [parameter.Uniform(log10_Apix_prior_min, log10_Apix_prior_max)(f"log10_Apix_{i}") for i in range(pt.npix)]
+                if pt.include_A2_pixel:
+                    log10_A2_prior = parameter.Uniform(log10_A2_prior_min, log10_A2_prior_max)("log10_A2")
+                    pt.priors = [log10_A2_prior, *log10_Apix_prior]
                 else:
-                    return np.longdouble((1 / 10) ** (len(params) - 1))
+                    pt.priors = log10_Apix_prior
+            
+            elif pt.mode == 'power_basis': 
+                log10_A2_prior = parameter.Uniform(log10_A2_prior_min, log10_A2_prior_max)("log10_A2") 
+                clm_prior = [parameter.Uniform(clm_prior_min, clm_prior_max)(f"c_{l}{m}") for l in range(1, pt.l_max+1) for m in range(-l, l+1)] 
+                pt.priors = [log10_A2_prior, *clm_prior]
 
-            else:
-                return np.longdouble((1 / 10) ** (len(params) - 1))
-
-        elif self.mode == 'sqrt_power_basis':
-            amp2 = params[0]
-            blm_params = params[1:]
-
-            if (amp2 < np.log10(1e-5) or amp2 > np.log10(1e3)):
-                return -np.inf
-
-            else:
-                idx = 1
-                for ll in range(self.blmax + 1):
-                    for mm in range(0, ll + 1):
-
-                        if ll == 0 and params[idx] != 1:
-                            return -np.inf #0
-
-                        if mm == 0 and (params[idx] > 5 or params[idx] < -5):
-                            return -np.inf #0
-
-                        if mm != 0 and (params[idx] > 5 or params[idx] < 0 or params[idx + 1] >= 2 * np.pi or params[idx + 1] < 0):
-                            return -np.inf #0
-
-                        if ll == 0:
-                            idx += 1
-                        elif mm == 0:
-                            idx += 1
+            elif pt.mode == 'sqrt_power_basis':
+                log10_A2_prior = parameter.Uniform(log10_A2_prior_min, log10_A2_prior_max)("log10_A2")
+                blm_prior = []
+                ### b_00 = 1 is set internally
+                for l in range(1, pt.blmax+1):
+                    for m in range(l+1):
+                        if m == 0:
+                            blm_prior.append(parameter.Uniform(bl0_prior_min, bl0_prior_max)(f"b_{l}{m}"))
                         else:
-                            idx += 2
+                            blm_prior.append(parameter.Uniform(blm_amp_prior_min, blm_amp_prior_max)(f"b_{l}{m}_amp"))
+                            blm_prior.append(parameter.Uniform(blm_phase_prior_min, blm_phase_prior_max)(f"b_{l}{m}_phase"))
+                        
+                pt.priors = [log10_A2_prior, *blm_prior]
+                
 
-                return np.longdouble((1 / 10) ** (len(params) - 1))
 
 
-    def logPrior(self, params):
+    def log_prior(self, params):
 
-        nmodel = int(np.rint(params[0]))
-        #print(nmodel)
+        nmodel_idx = int(np.rint(params[0]))
+        
+        if 0 <= nmodel_idx <= self.n_models-1:
+            ### Compare the union parameters with the parameters for each model
+            ### get the index and append those params into a new list and
+            ### calculate the LogPrior.
+            lP = 0
+            for pt in self.models.values():
+                lnpr = []
+                for pn in pt.param_names:
+                    idx = self.param_names.index(pn)
+                    lnpr.append(params[idx])
 
-        if nmodel <= -0.5 or nmodel > 0.5 * (2 * self.num_models - 1):
+                lP += pt.LogPrior(np.array(lnpr))
+                
+        else:
+            return -np.inf
+        
+
+        return lP
+
+
+    
+    def log_likelihood(self, params):
+
+        nmodel_idx = int(np.rint(params[0]))
+        if 0 <= nmodel_idx <= self.n_models-1:
+            nmodel = self.model_names[nmodel_idx]
+            lw_idx = self.model_names.index(nmodel)
+        else:
             return -np.inf
 
-        return np.log(self._standard_prior(params[1:]))
+        # find parameters of active model
+        lnlk = []
+        for pn in self.models[nmodel].param_names:
+            idx = self.param_names.index(pn)
+            lnlk.append(params[idx])
 
+        # only active parameters enter likelihood
+        active_lnlike = self.models[nmodel].LogLikelihood(lnlk)
 
-    def logLikelihood(self, params):
-
-        nmodel = int(np.rint(params[0]))
-        #print(nmodel)
-
-        active_lnlkl = self.models[nmodel].logLikelihood(params[1: self.models[nmodel].ndim + 1])
-
+        # Add log_weights to the active_lnlike if specified
         if self.log_weights is not None:
-            active_lnlkl += self.log_weights[nmodel]
-
-        return active_lnlkl
+            active_lnlike += self.log_weights[lw_idx]
 
 
-    def get_random_sample(self):
+        return active_lnlike
 
-        if self.mode == 'power_basis':
 
-            if self.use_physical_prior:
-                x0 = np.append(np.append(np.log10(nr.uniform(0, 30, 1)), np.array([np.sqrt(4 * np.pi)])), np.repeat(0, self.ndim - 3))
-                x0 = np.append(nr.uniform(-0.5, 0.5 + self.num_models, 1), x0)
+    
+    def initial_sample(self):
+
+        """
+        Draw an initial sample from within the hyper-model prior space.
+
+        Returns:
+            object: The initial sample vector of the hyper-model prior space.
+
+        Raises:
+            ValueError: If used before set_ptmcmc_hypermodel().
+        """
+
+        if self.models[self.model_names[0]].priors is None or self.models[self.model_names[0]].param_names is None:
+            raise ValueError("To activate this function, first set the sampler by set_ptmcmc_hypermodel()!")
+            
+
+        else:
+            ### To start get model 0 sample and param_names
+            x0 = [0.1, *[pr.sample() for pr in self.models[self.model_names[0]].priors]]
+            #x0 = [pr.sample() for pr in self.models[0].priors]
+            uniq_params = self.models[self.model_names[0]].param_names
+
+            ### Now find diff params between model 0 and 1, and create a mask
+            ### by compairing model 1 params with the diff params.
+            ### Extend the initial sample list with the new (diff) ones.
+            ### Finally, update uniq_params.
+            for pt in self.models.values():
+
+                diff_params = np.setdiff1d(pt.param_names, uniq_params)
+                mask = np.array([pn in diff_params for pn in pt.param_names])
+
+                x0.extend([ppr.sample() for ppr in np.array(pt.priors)[mask]])
+
+                uniq_params = np.union1d(pt.param_names, uniq_params)
+
+
+
+        return np.array(x0)
+
+
+
+    def set_ptmcmc_hypermodel(self, log10_A2_prior_min=-2, log10_A2_prior_max=2, log10_Apix_prior_min=-2, log10_Apix_prior_max=2, clm_prior_min=-5, clm_prior_max=5, 
+                             bl0_prior_min=-5, bl0_prior_max=5, blm_amp_prior_min=0, blm_amp_prior_max=5, blm_phase_prior_min=0, blm_phase_prior_max=2*np.pi, 
+                             outdir='./ptmcmc', resume=False, groups=None, save_anis_pta_hypermodel=False, 
+                             perform_noise_marginalization=False):
+
+        """A method to return the PTMCMC sampler to perform hyper-model sampling.
+
+        This function works with 'power_basis' for now and raise ValueError if other modes are used.
+
+        Args:
+            log10_A2_prior_min (float, optional): Lower bound for log10_A2 uniform priors. Defaults to -2.
+            log10_A2_prior_max (float, optional): Upper bound for log10_A2 uniform priors. Defaults to 2.
+            log10_Apix_prior_min (float, optional): Lower bound for pixel uniform priors. Defaults to -2.
+            log10_Apix_prior_max (float, optional): Upper bound for pixel uniform priors. Defaults to 2.
+            clm_prior_min (float, optional): Lower bound for clm's uniform priors. Defaults to -5.
+            clm_prior_max (float, optional): Upper bound for clm's uniform priors. Defaults to 5.
+            bl0_prior_min (float, optional): Lower bound for bl0 uniform priors. Defaults to -5.
+            bl0_prior_max (float, optional): Upper bound for bl0 uniform priors. Defaults to 5.
+            blm_amp_prior_min (float, optional): Lower bound for blm (m>=1) amplitude uniform priors. Defaults to 0.
+            blm_amp_prior_max (float, optional): Upper bound for blm (m>=1) amplitude uniform priors. Defaults to 5.
+            blm_phase_prior_min (float, optional): Lower bound for blm (m>=1) phase uniform priors. Defaults to 0.
+            blm_phase_prior_max (float, optional): Upper bound for blm (m>=1) phase uniform priors. Defaults to 2*pi.
+            outdir (str, optional): The path to save the chains. Defaults to './ptmcmc'
+            resume (bool, optional): Whether to resume a previous run. Defaults to False
+            save_anis_pta_hypermodel (bool, optional): Whether to save the anisotropy object for post prcessing help. Defaults to False.
+
+        Returns:
+            object: The PTMCMC sampler object.
+
+        Raises:
+            ValueError: If mode is not 'power_basis' or 'sqrt_power_basis'.
+        """
+
+        ### Set priors for each anis_pta model in self.models
+        self._log_prior_by_mode(log10_A2_prior_min, log10_A2_prior_max, log10_Apix_prior_min, log10_Apix_prior_max, 
+                                clm_prior_min, clm_prior_max, bl0_prior_min, bl0_prior_max, 
+                                blm_amp_prior_min, blm_amp_prior_max, blm_phase_prior_min, blm_phase_prior_max)
+        
+        #NM?
+        self.perform_noise_marginalization = bool(perform_noise_marginalization)
+        self._set_pta_if_NM()
+
+        ### Define unique prior list to sample over and save
+        self.priors = [pr for pr in self.models[self.model_names[0]].priors]  # start of param list
+        uniq_params = [pn for pn in self.models[self.model_names[0]].param_names]  # which params are unique
+        for pt in self.models.values():
+            # find differences between next model and concatenation of previous
+            diff_params = np.setdiff1d(pt.param_names, uniq_params)
+            mask = np.array([pd in diff_params for pd in pt.param_names])
+            # concatenate for next loop iteration
+            uniq_params = np.union1d(pt.param_names, uniq_params)
+            # extend list of unique priors
+            self.priors.extend([ppr for ppr in np.array(pt.priors)[mask]])
+        
+        
+        self.outdir = outdir
+        
+        # initial jump covariance matrix
+        if os.path.exists(outdir + "/cov.npy") and resume:
+            cov = np.load(outdir + "/cov.npy")
+
+            # check that the one we load is the same shape as our data
+            cov_new = np.diag(np.ones(self.ndim) * 1.0**2)
+            if cov.shape != cov_new.shape:
+                msg = "The covariance matrix (cov.npy) in the output folder is "
+                msg += "the wrong shape for the parameters given. "
+                msg += "Start with a different output directory or "
+                msg += "change resume to False to overwrite the run that exists."
+
+                raise ValueError(msg)
+        else:
+            cov = np.diag(np.ones(self.ndim) * 1.0**2)
+
+        # Get the parameter group for sampling in hypermodel
+        if groups is None:
+            groups = self.get_parameter_groups()
+
+        # intialize sampler
+        sampler = ptmcmc(self.ndim, self.log_likelihood, self.log_prior, cov, outDir=outdir, resume=resume, groups=groups)
+
+
+        # Model index distribution draw
+        print("Adding nmodel uniform distribution draws...\n")
+        sampler.addProposalToCycle(self.draw_from_nmodel_prior, 25)
+
+
+        # save paramter list
+        with open(os.path.join(outdir, "pars.txt"), "w") as f:
+            for pn in self.param_names:
+                f.write(pn + "\n")
+
+        # save list of priors
+        with open(os.path.join(outdir, "priors.txt"), "w") as f:
+            for pr in self.priors:
+                f.write(pr.__repr__() + "\n")
+
+        # save the anisotropy object
+        if save_anis_pta_hypermodel:
+            saved_priors = self.priors
+            del self.priors # cannot pickle with parameter class of enterprise.signals
+            saved_pta_priors = []
+            for pt in self.models.values():
+                saved_pta_priors.append(pt.priors)
+                del pt.priors
+            
+            with open(os.path.join(outdir, "anis_pta_hypermodel.pickle"), "wb") as file:
+                pickle.dump(self, file)
+
+            self.priors = saved_priors # reassigning the priors
+            for i,pt in enumerate(self.models.values()):
+                pt.priors = saved_pta_priors[i]
+   
+
+        return sampler
+        
+
+
+    def draw_from_nmodel_prior(self, params, iter, beta):
+        """
+        Model-index uniform distribution prior draw.
+        """
+
+        q = params.copy()
+
+        #idx = list(self.param_names).index("nmodel")
+        nmodel_idx = list(self.param_names).index("nmodel")
+        q[nmodel_idx] = np.random.uniform(-0.5, self.n_models - 0.5)
+
+        lqxy = 0
+
+        #with open(os.path.join(self.outdir, "samples_before_nmodel_draw.txt"), "a") as f1:
+        #    f1.write(" ".join(map(str, params)))
+        #    f1.write("\n")
+            
+        #with open(os.path.join(self.outdir, "samples_after_nmodel_draw.txt"), "a") as f2:
+        #    f2.write(" ".join(map(str, q)))
+        #    f2.write("\n")
+
+        return q, float(lqxy)
+
+
+
+    def get_parameter_groups(self):
+
+        ### First a group of the whole parameter space
+        groups = [list(np.arange(1, self.ndim))]
+
+        ### Now grouping per pta parameters
+        for n in self.model_names:
+            groups_per_pta = []
+            for p in self.models[n].param_names:
+                groups_per_pta.append(self.param_names.index(p))
+            # check if some groups are same
+            if groups_per_pta in groups:
+                continue
             else:
-                x0 = np.append(np.append(np.log10(nr.uniform(0, 30, 1)), np.array([np.sqrt(4 * np.pi)])), nr.uniform(-5, 5, self.ndim - 3))
-                x0 = np.append(nr.uniform(-0.5, 0.5 + self.num_models, 1), x0)
+                groups.append(groups_per_pta)
 
-        elif self.mode == 'sqrt_power_basis':
+        nmodel_idx = list(self.param_names).index("nmodel")
+        #nmodel_idx = 0
 
-            x0 = np.full(self.ndim, 0.0)
+        ### Second a group of individual parameters excluding nmodel
+        #for idx in range(1, self.ndim):
+            #unique_groups.append([idx])
+        
+        
+        ### Lastly a group of nmodel
+        groups.append([nmodel_idx])
 
-            x0[0] = nr.uniform(-0.5, 0.5 * (2 * self.num_models - 1), 1)
+        return groups
+        
 
-            x0[1] = nr.uniform(np.log10(1e-5), np.log10(30))
 
-            idx = 2
-            for ll in range(self.blmax + 1):
-                for mm in range(0, ll + 1):
 
-                    if ll == 0:
-                        x0[idx] = 1.
-                        idx += 1
 
-                    elif mm == 0:
-                        x0[idx] = 0 #nr.uniform(0, 5)
-                        idx += 1
+class set_bilby(bilby.Likelihood):
 
-                    elif mm != 0:
-                        x0[idx] = 0 #nr.uniform(0, 5)
-                        x0[idx + 1] = 0 #nr.uniform(0, 2 * np.pi)
-                        idx += 2
+    def __init__(self, anisotropy_pta, log10_A2_prior_min=-2, log10_A2_prior_max=2, log10_Apix_prior_min=-2, log10_Apix_prior_max=2, clm_prior_min=-5, clm_prior_max=5, 
+                 bl0_prior_min=-5, bl0_prior_max=5, blm_amp_prior_min=0, blm_amp_prior_max=5, blm_phase_prior_min=0, blm_phase_prior_max=2*np.pi,
+                 perform_noise_marginalization=False, outdir='./bilby', save_anis_pta=False):
 
-        return x0
+        """A class to perform bilby bayesian sampling with an anisotropy pta.
+
+        This class can be used to perform bilby sampling by passing it the anisotropy pta.
+        It constructs the anisotropic pta log-likelihood and log-prior functions internally and returns a
+        bilby.Likelihood class object which can be simply supplied to bilby samplers to 
+        perform bayesian inference with all the bilby-available samplers.
+        
+        Attributes:
+            anisotropy_pta (object, required) : The anisotropic pta object defined by MAPS.
+            log10_A2_prior_min (float, optional): Lower bound for log10_A2 uniform priors. Defaults to -2.
+            log10_A2_prior_max (float, optional): Upper bound for log10_A2 uniform priors. Defaults to 2.
+            log10_Apix_prior_min (float, optional): Lower bound for pixel uniform priors. Defaults to -2.
+            log10_Apix_prior_max (float, optional): Upper bound for pixel uniform priors. Defaults to 2.
+            clm_prior_min (float, optional): Lower bound for clm's uniform priors. Defaults to -5.
+            clm_prior_max (float, optional): Upper bound for clm's uniform priors. Defaults to 5.
+            bl0_prior_min (float, optional): Lower bound for bl0 uniform priors. Defaults to -50.
+            bl0_prior_max (float, optional): Upper bound for bl0 uniform priors. Defaults to 50.
+            blm_amp_prior_min (float, optional): Lower bound for blm (m>=1) amplitude uniform priors. Defaults to 0.
+            blm_amp_prior_max (float, optional): Upper bound for blm (m>=1) amplitude uniform priors. Defaults to 50.
+            blm_phase_prior_min (float, optional): Lower bound for blm (m>=1) phase uniform priors. Defaults to 0.
+            blm_phase_prior_max (float, optional): Upper bound for blm (m>=1) phase uniform priors. Defaults to 2*pi.
+            save_anis_pta (bool, optional): Whether to save the anis_pta as a pickle.
+
+        Returns:
+            object: bilby.Likelihood class object.
+    """
+
+
+        self.anisotropy_pta = anisotropy_pta
+        self.perform_noise_marginalization = perform_noise_marginalization
+        if self.anisotropy_pta.mode == 'pixel':
+            if self.anisotropy_pta.include_A2_pixel:
+                self.log10_A2_prior_min = log10_A2_prior_min
+                self.log10_A2_prior_max = log10_A2_prior_max
+                
+            self.log10_Apix_prior_min = log10_Apix_prior_min
+            self.log10_Apix_prior_max = log10_Apix_prior_max
+            
+        elif self.anisotropy_pta.mode == 'power_basis':
+            #params = {"log10_A2": 0.0, **{f"c_{l}{m}": 0.0 for l in range(1, anisotropy_pta.l_max+1) for m in range(-l, l+1)}}
+            self.log10_A2_prior_min = log10_A2_prior_min
+            self.log10_A2_prior_max = log10_A2_prior_max
+        
+            self.clm_prior_min = clm_prior_min
+            self.clm_prior_max = clm_prior_max
+
+        elif self.anisotropy_pta.mode == 'sqrt_power_basis':
+            #params = {"log10_A2": 0.0, **{f"b_{l}{m}": 0.0 for l in range(1, anisotropy_pta.blmax+1) for m in range(l+1)}}
+            self.log10_A2_prior_min = log10_A2_prior_min
+            self.log10_A2_prior_max = log10_A2_prior_max
+            
+            self.bl0_prior_min = bl0_prior_min
+            self.bl0_prior_max = bl0_prior_max
+            self.blm_amp_prior_min = blm_amp_prior_min
+            self.blm_amp_prior_max = blm_amp_prior_max
+            self.blm_phase_prior_min = blm_phase_prior_min
+            self.blm_phase_prior_max = blm_phase_prior_max
+            
+        else:
+            raise ValueError("Bilby is only compatible with modes used in MAPS!")
+
+        ### The sampler takes the parameter dictionary here to evaluate likelihood
+        #super().__init__(parameters=params)
+        
+        self.priors = self._priors()
+    
+        ### The sampler takes the parameter dictionary here to evaluate likelihood
+        super(set_bilby, self).__init__(parameters={key : None for key in self.priors}) #self.priors[key].sample()
+        
+        self.parameter_keys = list(self.priors.keys())
+        self.ndim = len(self.parameter_keys)
+        
+        self.anisotropy_pta.param_names = self.parameter_keys
+        self.anisotropy_pta.priors = self.priors
+        self.anisotropy_pta.ndim = self.ndim
+        self.anisotropy_pta.bilby_likelihood_class = self
+        
+
+        # save the anisotropy object
+        if save_anis_pta:
+            os.makedirs(outdir, exist_ok=True) # creates the directory if doesn't exists
+            with open(os.path.join(outdir, "anis_pta.pickle"), "wb") as file:
+                pickle.dump(self.anisotropy_pta, file)
+    
+
+    def _priors(self):
+
+        """A method to set the priors for the given mode.
+
+        This function works with 'power_basis', 'sqrt_power_basis' and 'pixel' basis/mode for now.
+
+        Returns:
+            dict: Prior Dictionary.
+        """
+
+        if self.anisotropy_pta.mode == 'pixel':
+            priors = bilby.core.prior.PriorDict()
+            if self.anisotropy_pta.include_A2_pixel:
+                priors["log10_A2"] = Uniform(name="log10_A2", minimum=self.log10_A2_prior_min, maximum=self.log10_A2_prior_max)
+
+            for i in range(self.anisotropy_pta.npix):
+                priors[f"log10_Apix_{i}"] = Uniform(name=f"log10_Apix_{i}", minimum=self.log10_Apix_prior_min, maximum=self.log10_Apix_prior_max)
+
+
+        elif self.anisotropy_pta.mode == 'power_basis':
+            priors = bilby.core.prior.PriorDict()
+            priors["log10_A2"] = Uniform(name="log10_A2", minimum=self.log10_A2_prior_min, maximum=self.log10_A2_prior_max)
+
+            for l in range(1, self.anisotropy_pta.l_max+1):
+                for m in range(-l, l+1):
+                    priors[f"c_{l}{m}"] = Uniform(name=f"c_{l}{m}", minimum=self.clm_prior_min, maximum=self.clm_prior_max)
+
+        
+        elif self.anisotropy_pta.mode == 'sqrt_power_basis':
+            priors = bilby.core.prior.PriorDict()
+            priors["log10_A2"] = Uniform(name="log10_A2", minimum=self.log10_A2_prior_min, maximum=self.log10_A2_prior_max)
+
+            ### b_00 = 1 is set internally
+            for l in range(1, self.anisotropy_pta.blmax+1):
+                for m in range(l+1):
+                    if m == 0:
+                        priors[f"b_{l}{m}"] = Uniform(name=f"b_{l}{m}", minimum=self.bl0_prior_min, maximum=self.bl0_prior_max)
+                    else:
+                        priors[f"b_{l}{m}_amp"] = Uniform(name=f"b_{l}{m}_amp", minimum=self.blm_amp_prior_min, maximum=self.blm_amp_prior_max)
+                        priors[f"b_{l}{m}_phase"] = Uniform(name=f"b_{l}{m}_phase", minimum=self.blm_phase_prior_min, maximum=self.blm_phase_prior_max)
+
+        return priors
+
+
+    def log_likelihood(self):#, parameters=None):
+
+        """A method to return the log-likelihood for the set of parameters defined by the mode in anisotropy_pta.
+
+        This function works with 'power_basis' for now.
+
+        Returns:
+            float: The log-likelihood for the given parameters.
+        """
+
+        if self.anisotropy_pta.mode == 'pixel':
+
+            params = np.array([self.parameters[key] for key in self.parameter_keys])
+            if self.anisotropy_pta.include_A2_pixel:
+                A2 = 10 ** params[0]
+                Apix = 10 ** params[1:]
+            else:
+                A2 = 1.0
+                Apix = 10 ** params
+            
+            map_from_Apix = Apix * np.ones(self.anisotropy_pta.npix)
+            
+            sim_orf = A2 * (self.anisotropy_pta.F_mat @ map_from_Apix)
+            
+
+        elif self.anisotropy_pta.mode == 'power_basis':
+            
+            params = np.array([self.parameters[key] for key in self.parameter_keys])
+            A2 = 10 ** params[0]
+            ### Fixing c_00 = root(4pi)
+            clm_00 = np.sqrt(4*np.pi)
+            clm_wo_00 = params[1:]
+            clm = np.concatenate(([clm_00], clm_wo_00))
+
+            sim_orf = A2 * (self.anisotropy_pta.Gamma_lm.T @ clm) #[:, np.newaxis]) # (ncc x nclm) @ (nclm x 1) => RP - (ncc x 1)
+
+        
+        elif self.anisotropy_pta.mode == 'sqrt_power_basis':
+
+            params = np.array([self.parameters[key] for key in self.parameter_keys])
+            A2 = 10 ** params[0]
+            blm = params[1:]
+
+            ### Convert blm amp & phase to complex blms (still no '-m'; size:l>=1,m>=0->l + 00) b_00 is set internally here
+            ### Convert complex blms to alms / complex clms (now with '-m'; size:(lmax+1)**2)
+            ### Convert complex clms / alms to real clms and normalize to c_00=root(4pi)
+            b_00 = 1.0
+            clm = utils.convert_blm_params_to_clm(self.anisotropy_pta, [b_00, *blm]) # need to pass b_00 here
+            
+            sim_orf = A2 * (self.anisotropy_pta.Gamma_lm.T @ clm) #[:, np.newaxis]) # (ncc x nclm) @ (nclm x 1) => RP - (ncc x 1)
+
+        
+        residual = self.anisotropy_pta.rho - sim_orf # rho (ncc x 1) - RP (ncc x 1) => (ncc x 1)
+        
+        if self.anisotropy_pta.pair_cov is not None:
+            lik_num = (residual.T @ self.anisotropy_pta.pair_cov_N_inv @ residual) # (1 x ncc) @ (ncc x ncc) @ (ncc x 1) => ()
+            loglike = -0.5 * np.sum(lik_num + self.anisotropy_pta._lik_denom)
+
+        else:
+            lik_num = (residual**2) / (self.anisotropy_pta.sig**2)
+            lik_denom = 2 * np.pi * (self.anisotropy_pta.sig**2)
+            #if self.anisotropy_pta.include_noise_marginalization:
+            #    loglike_per_draw = -0.5 * np.sum(lik_num + np.log(lik_denom), axis=1)
+            #    loglike = scsp.logsumexp(loglike_per_draw) - np.log(self.anisotropy_pta.NM)
+            if self.perform_noise_marginalization:
+                loglike_per_draw = -0.5 * np.sum(lik_num + np.log(lik_denom), axis=1)
+                loglike = np.sum(loglike_per_draw) - self.anisotropy_pta.n_draws
+                #loglike = scsp.logsumexp(loglike_per_draw) - np.log(self.anisotropy_pta.n_draws)
+            else:
+                loglike = -0.5 * np.sum(lik_num + np.log(lik_denom))
+
+
+        return loglike
+
+
+    
+    def noise_log_likelihood(self):
+
+        """A method to return the noise (isotropic) log-likelihood for the given set of parameters defined by the mode in anisotropy_pta.
+
+        This function works with 'power_basis' for now.
+
+        Returns:
+            float: The noise (isotropic) log-likelihood for the given parameters.
+        """
+        
+        if self.anisotropy_pta.mode == 'pixel':
+
+            #params = np.array([self.parameters[key] for key in self.parameter_keys])
+            #if self.anisotropy_pta.include_A2_pixel:
+                #A2 = 10 ** params[0]
+                #Apix = 10 ** params[1:]
+            #else:
+                #A2 = 1.0
+                #Apix = 10 ** params
+            
+            map_from_Apix_ones = np.ones(self.anisotropy_pta.npix)
+            
+            #sim_orf = A2 * (self.anisotropy_pta.F_mat @ map_from_Apix_ones)
+            sim_orf = self.anisotropy_pta.F_mat @ map_from_Apix_ones
+
+
+        elif self.anisotropy_pta.mode == 'power_basis':
+            
+            #params = np.array([self.parameters[key] for key in self.parameter_keys])
+            #A2 = 10 ** params[0]
+            ### Fixing c_00 = root(4pi)
+            clm_00 = np.sqrt(4*np.pi)
+            clm = np.array([clm_00, *np.zeros(shape=self.ndim-1)])
+            #clm_wo_00 = params[1:]
+            #clm_wo_00_zeros = np.zeros(len(clm_wo_00))
+            #clm_zeros = np.concatenate(([clm_00], clm_wo_00_zeros))
+
+            sim_orf = self.anisotropy_pta.Gamma_lm.T @ clm
+
+
+        elif self.anisotropy_pta.mode == 'sqrt_power_basis':
+        
+            #params = np.array([self.parameters[key] for key in self.parameter_keys])
+            #A2 = 10 ** params[0]
+            #blm = params[1:]
+            #blm_zeros = np.zeros(len(blm))
+
+            ### Convert blm amp & phase to complex blms (still no '-m'; size:l>=1,m>=0->l + 00) b_00 is set internally here
+            ### Convert complex blms to alms / complex clms (now with '-m'; size:(lmax+1)**2)
+            ### Convert complex clms / alms to real clms and normalize to c_00=root(4pi)
+            #b_00 = 1.0
+            clm_00 = np.sqrt(4*np.pi)
+            clm = np.array([clm_00, *np.zeros(shape=self.anisotropy_pta.clm_size-1)])
+            #clm_zeros = utils.convert_blm_params_to_clm(self.anisotropy_pta, [b_00, *blm_zeros]) # need to pass b_00 here
+            
+            sim_orf = self.anisotropy_pta.Gamma_lm.T @ clm
+            
+            
+        residual = self.anisotropy_pta.rho - sim_orf
+        
+        if self.anisotropy_pta.pair_cov is not None:
+            iso_lik_num = (residual.T @ self.anisotropy_pta.pair_cov_N_inv @ residual) # (1 x ncc) @ (ncc x ncc) @ (ncc x 1) => ()
+            iso_loglike = -0.5 * np.sum(iso_lik_num + self.anisotropy_pta._lik_denom)
+        
+        else:
+            iso_lik_num = (residual**2) / (self.anisotropy_pta.sig**2)
+            iso_lik_denom = 2 * np.pi * (self.anisotropy_pta.sig**2)
+            #if self.anisotropy_pta.include_noise_marginalization:
+            #    loglike_per_draw = -0.5 * np.sum(lik_num + np.log(lik_denom), axis=1)
+            #    loglike = scsp.logsumexp(loglike_per_draw) - np.log(self.anisotropy_pta.NM)
+            if self.perform_noise_marginalization:
+                iso_loglike_per_draw = -0.5 * np.sum(iso_lik_num + np.log(iso_lik_denom), axis=1)
+                iso_loglike = np.sum(iso_loglike_per_draw) - self.anisotropy_pta.n_draws
+                #iso_loglike = scsp.logsumexp(iso_loglike_per_draw) - np.log(self.anisotropy_pta.n_draws)
+            else:
+                iso_loglike = -0.5 * np.sum(iso_lik_num + np.log(iso_lik_denom))
+        
+
+        return iso_loglike
+    
