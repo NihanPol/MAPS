@@ -454,9 +454,9 @@ class anis_pta():
                 if mm == 0:
                     clm[clmindex] = alm[almindex].real
                 elif mm < 0:
-                    clm[clmindex] = (-1) ** mm * alm[almindex].imag * np.sqrt(2)
+                    clm[clmindex] = -alm[almindex].imag * np.sqrt(2)
                 elif mm > 0:
-                    clm[clmindex] = (-1) ** mm * alm[almindex].real * np.sqrt(2)
+                    clm[clmindex] = alm[almindex].real * np.sqrt(2)
 
                 clmindex += 1
 
